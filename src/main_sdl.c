@@ -377,6 +377,7 @@ typedef struct {
     SDL_Gamepad *pad;
     Action pad_act[32], lt_act, rt_act;
     int joy_buttons;
+    uint8_t pad_route[32]; /* where a held pad button went: 0 none, 1 mouse, 2 its action */
     int view_dir;          /* current right-stick view key */
     double lt_next, rt_next;
     int lt_down, rt_down;
@@ -766,6 +767,37 @@ static void ini_set(const char *path, const char *section, const char *key, cons
     if (f) { fwrite(out, 1, o, f); fclose(f); }
 }
 
+/* A and B click the mouse in menus and on the map, and are the fire buttons in
+ * flight. A release must go where the press went: leaving the map with A used
+ * to leave the mouse button held (or the joystick button), and the aircraft
+ * kept firing back in the cockpit. */
+static void pad_button(App *a, int btn, int down) {
+    if (btn < 0 || btn >= 32) return;
+    int route;
+    if (down) {
+        if (a->pad_route[btn]) return; /* already held */
+        route = (!machine_in_3d(a->m) && (btn == SDL_GAMEPAD_BUTTON_SOUTH || btn == SDL_GAMEPAD_BUTTON_EAST)) ? 1 : 2;
+        a->pad_route[btn] = (uint8_t)route;
+    } else {
+        route = a->pad_route[btn];
+        a->pad_route[btn] = 0;
+        if (!route) return;
+    }
+    if (route == 1) {
+        int bit = btn == SDL_GAMEPAD_BUTTON_SOUTH ? 1 : 2;
+        int b = a->m->mouse_buttons;
+        if (down) b |= bit; else b &= ~bit;
+        machine_mouse_buttons(a->m, b);
+    } else {
+        do_action(a, &a->pad_act[btn], down);
+    }
+}
+
+/* release everything the gamepad still holds (gamepad unplugged) */
+static void pad_release_all(App *a) {
+    for (int b = 0; b < 32; b++) if (a->pad_route[b]) pad_button(a, b, 0);
+}
+
 static void poll_gamepad(App *a, double now_ms) {
     a->pad_ok = 0;
     if (!a->pad) return;
@@ -1099,19 +1131,11 @@ int main(int argc, char **argv) {
             }
             case SDL_EVENT_GAMEPAD_ADDED: open_first_pad(a); break;
             case SDL_EVENT_GAMEPAD_REMOVED:
-                if (a->pad && SDL_GetGamepadID(a->pad) == e.gdevice.which) { SDL_CloseGamepad(a->pad); a->pad = NULL; set_status(a, "Gamepad disconnected"); open_first_pad(a); }
+                if (a->pad && SDL_GetGamepadID(a->pad) == e.gdevice.which) { pad_release_all(a); SDL_CloseGamepad(a->pad); a->pad = NULL; set_status(a, "Gamepad disconnected"); open_first_pad(a); }
                 break;
             case SDL_EVENT_GAMEPAD_BUTTON_DOWN: case SDL_EVENT_GAMEPAD_BUTTON_UP: {
                 int down = e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
-                int btn = e.gbutton.button;
-                if (!machine_in_3d(a->m) && (btn == SDL_GAMEPAD_BUTTON_SOUTH || btn == SDL_GAMEPAD_BUTTON_EAST)) {
-                    int bit = btn == SDL_GAMEPAD_BUTTON_SOUTH ? 1 : 2;
-                    int b = a->m->mouse_buttons;
-                    if (down) b |= bit; else b &= ~bit;
-                    machine_mouse_buttons(a->m, b);
-                    break;
-                }
-                if (btn >= 0 && btn < 32) do_action(a, &a->pad_act[btn], down);
+                pad_button(a, e.gbutton.button, down);
                 break;
             }
             default: break;

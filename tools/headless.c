@@ -113,6 +113,8 @@ int main(int argc, char **argv) {
                 double x, y; sscanf(e->arg, "%lf %lf", &x, &y); machine_mouse_abs(m, x, y);
             } else if (!strcmp(e->cmd, "click")) {
                 int b = atoi(e->arg); machine_mouse_buttons(m, b); machine_run(m, 100000); t += 100; machine_mouse_buttons(m, 0);
+            } else if (!strcmp(e->cmd, "mbtn")) {
+                machine_mouse_buttons(m, atoi(e->arg));
             } else if (!strcmp(e->cmd, "rel")) {
                 int dx, dy; sscanf(e->arg, "%d %d", &dx, &dy); machine_mouse_move(m, dx, dy);
             } else if (!strcmp(e->cmd, "dump")) {
