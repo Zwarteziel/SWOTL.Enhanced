@@ -579,6 +579,11 @@ static void service_events(Machine *m) {
     }
 }
 
+static int sig_match(const uint8_t *p, const uint8_t *sig, const uint8_t *any, size_t n) {
+    for (size_t i = 0; i < n; i++) if (!any[i] && p[i] != sig[i]) return 0;
+    return 1;
+}
+
 void machine_run(Machine *m, double us) {
     double end = m->time_us + us;
     CPU *c = &m->cpu;
@@ -607,13 +612,17 @@ void machine_run(Machine *m, double us) {
     opl_sync(m);
     /* find the VGA driver's frame-present routine (RTSVGA.OVL) to count frames */
     if (m->time_us - m->sig_scan_us > 1e6) {
-        static const uint8_t sig[] = {0x55, 0x8B, 0xEC, 0x1E, 0x2E, 0x8C, 0x1E, 0x0C, 0x33, 0x2E, 0xC7, 0x06, 0x0E, 0x33, 0x00, 0x00, 0x56, 0x57, 0xFC};
+        /* push bp; mov bp,sp; push ds; mov cs:[xxxx],ds; mov word cs:[xxxx],0;
+         * push si; push di; cld. The xxxx offsets differ between game
+         * versions (1991: 330C/330E, 1993 release: 35DC/35DE). */
+        static const uint8_t sig[] = {0x55, 0x8B, 0xEC, 0x1E, 0x2E, 0x8C, 0x1E, 0x00, 0x00, 0x2E, 0xC7, 0x06, 0x00, 0x00, 0x00, 0x00, 0x56, 0x57, 0xFC};
+        static const uint8_t any[sizeof sig] = {0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0};
         m->sig_scan_us = m->time_us;
         uint32_t w = m->cpu.watch_lin;
-        if (!w || memcmp(m->mem + w, sig, sizeof sig)) {
+        if (!w || !sig_match(m->mem + w, sig, any, sizeof sig)) {
             m->cpu.watch_lin = 0;
             for (uint32_t a = 0x500; a < 0xA0000 - sizeof sig; a++)
-                if (m->mem[a] == 0x55 && !memcmp(m->mem + a, sig, sizeof sig)) { m->cpu.watch_lin = a; break; }
+                if (m->mem[a] == 0x55 && sig_match(m->mem + a, sig, any, sizeof sig)) { m->cpu.watch_lin = a; break; }
         }
     }
 }

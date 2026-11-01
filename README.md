@@ -1,9 +1,11 @@
 # SWOTL Enhanced
 
-Version 0.1.12
+Version 0.1.13
 
 Run **Secret Weapons of the Luftwaffe** (Lucasfilm Games, 1991) on modern Windows
 without installing DOSBox. You need your own copy of the original game files.
+Tested with the original 1991 release and with the later 1993 release that
+includes the P-38, P-80, He 162 and Do 335 tours of duty.
 
 This is phase 1 of the project. The original `SWOTL.EXE` and its overlay files run
 inside a small PC emulation layer made for this one game. The layer covers the
