@@ -1,0 +1,13 @@
+build/
+*.ppm
+*.png
+*.bmp
+gmon.out
+# never commit game files or local runs
+*.exe
+*.EXE
+*.OVL
+*.avi
+*.log
+*.ini
+*.ini.bak

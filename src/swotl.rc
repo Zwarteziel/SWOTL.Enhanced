@@ -1,0 +1,24 @@
+#include "version.h"
+1 VERSIONINFO
+FILEVERSION APP_VERSION_NUM
+PRODUCTVERSION APP_VERSION_NUM
+FILEOS 0x40004
+FILETYPE 1
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "FileDescription", "SWOTL Enhanced - runs Secret Weapons of the Luftwaffe on Windows"
+      VALUE "FileVersion", APP_VERSION
+      VALUE "ProductName", "SWOTL Enhanced"
+      VALUE "ProductVersion", APP_VERSION
+      VALUE "OriginalFilename", "SWOTL-Enhanced.exe"
+      VALUE "LegalCopyright", "(c) 2026 Zwarteziel, GPL-3.0-or-later. Game (c) Lucasfilm Games - not included."
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END
