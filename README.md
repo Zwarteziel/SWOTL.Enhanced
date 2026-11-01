@@ -1,6 +1,6 @@
 # SWOTL Enhanced
 
-Version 0.1.10
+Version 0.1.11
 
 Run **Secret Weapons of the Luftwaffe** (Lucasfilm Games, 1991) on modern Windows
 without installing DOSBox. You need your own copy of the original game files.
@@ -23,11 +23,11 @@ scaling, sound and gamepads.
   automatically.
 - **AdLib music and sound effects.** Emulated with Nuked-OPL3.
 - **Mouse.** The mouse is captured when you click in the window.
-- **Tempo.** The title bar shows the game's tempo: emulated time against real
-  time. At 100% the game runs exactly as fast as on a real PC. If your PC cannot
+- **Speed.** The title bar shows the game's speed (`speed`): emulated time
+  against real time. At 100% the game runs exactly as fast as on a real PC. If your PC cannot
   keep up, it drops below 100% and everything gets slower, the flying too.
-- **Speed.** The emulated CPU speed adapts to your PC. The title bar shows the
-  real 3D frame rate. It counts the game's own frame-present calls in the VGA
+- **Frame rate.** The emulated CPU speed adapts to your PC. The title bar shows
+  the real 3D frame rate (`fps`; a dash outside the 3D view). It counts the game's own frame-present calls in the VGA
   driver. At 10 MIPS it is about 16 fps, at 20 MIPS about 34 fps and at 40 MIPS
   about 63 fps. The flight model runs on the game's 237 Hz timer, so the frame
   rate does not change how the aircraft handle.
@@ -72,7 +72,7 @@ comments in the file are not carried over.
 | Ctrl+F10 | Release or capture the mouse |
 | F12 | Screenshot (`swotlNNNN.bmp`) |
 | Ctrl+F11 / Ctrl+F12 | Lower / raise the CPU speed limit |
-| Ctrl+F9 | Show the 3D frame rate in the picture (it is always in the title bar) |
+| Ctrl+F9 | Show speed, frame rate and CPU speed in the picture (they are always in the title bar) |
 | Ctrl+F6 | CRT shader on/off (saved in the ini file) |
 | Ctrl+F7 / Ctrl+F8 | Make the gamepad stick less / more curved (saved in the ini file) |
 | Ctrl+F5 | Start / stop a diagnostic recording (`swotl-rec-NNNN.avi` + `.log`, max 60 s) |
@@ -106,7 +106,7 @@ deflection. Ctrl+F7 / Ctrl+F8 change the curve in steps of 0.25 while you fly.
 **Diagnostic recording.** Ctrl+F5 records the game picture (320x200, 30 fps,
 uncompressed AVI) to `swotl-rec-NNNN.avi` in the game folder. The top-left
 corner of the picture shows the input state. A `.log` file next to it lists, for
-each frame, the timing (tempo, fps, CPU speed), the keys and the stick values
+each frame, the timing (speed, fps, CPU speed), the keys and the stick values
 sent to the game. A recording of 20 seconds is about 115 MB.
 
 ## CRT shader

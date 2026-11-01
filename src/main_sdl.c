@@ -184,7 +184,8 @@ static void config_write(const char *path, const Config *c) {
         "integer=%d\n"
         "; mouse speed multiplier (the mouse is captured when you click in the window)\n"
         "mouse_speed=%g\n"
-        "; show the 3D frame rate in the picture (Ctrl+F9 toggles); it is always in the title bar\n"
+        "; show speed, frame rate and CPU speed in the picture (Ctrl+F9 toggles);\n"
+        "; they are always in the title bar\n"
         "show_fps=%d\n\n",
         c->fullscreen, c->width, c->height, shader_to_str(c->shader),
         c->renderer_sdl ? "sdl" : "opengl",
@@ -452,9 +453,9 @@ static void update_layout(App *a) {
 static void update_title(App *a) {
     char title[256];
     int n = snprintf(title, sizeof title, APP_NAME " v" APP_VERSION);
-    if (a->tempo > 0) n += snprintf(title + n, sizeof title - n, "  |  tempo %.0f%%", a->tempo * 100);
-    if (a->fps >= 0) n += snprintf(title + n, sizeof title - n, "  |  3D: %.0f fps", a->fps);
-    else n += snprintf(title + n, sizeof title - n, "  |  3D: -");
+    if (a->tempo > 0) n += snprintf(title + n, sizeof title - n, "  |  speed %.0f%%", a->tempo * 100);
+    if (a->fps >= 0) n += snprintf(title + n, sizeof title - n, "  |  fps %.0f", a->fps);
+    else n += snprintf(title + n, sizeof title - n, "  |  fps -");
     n += snprintf(title + n, sizeof title - n, "  |  CPU %.0f MIPS", a->m ? a->m->ips : a->cfg.mips);
     if (a->status[0]) snprintf(title + n, sizeof title - n, "  |  %s", a->status);
     SDL_SetWindowTitle(a->win, title);
@@ -506,8 +507,8 @@ static void present_gl(App *a, int w, int h) {
     }
     if (a->cfg.show_fps) {
         char txt[96];
-        if (a->fps >= 0) snprintf(txt, sizeof txt, "3D %.0f fps  %.0f MIPS  tempo %.0f%%", a->fps, a->m->ips, a->tempo * 100);
-        else snprintf(txt, sizeof txt, "3D -  %.0f MIPS  tempo %.0f%%", a->m->ips, a->tempo * 100);
+        if (a->fps >= 0) snprintf(txt, sizeof txt, "speed %.0f%%  fps %.0f  CPU %.0f MIPS", a->tempo * 100, a->fps, a->m->ips);
+        else snprintf(txt, sizeof txt, "speed %.0f%%  fps -  CPU %.0f MIPS", a->tempo * 100, a->m->ips);
         int ww, wh; crtgl_output_size(a->gl, &ww, &wh);
         int x = ww / 2 - (int)strlen(txt) * 8 - 8;
         gl_text_box(a, x, 4, txt, 0xFFA0FFA0u);
@@ -583,8 +584,8 @@ static void present(App *a) {
     }
     if (a->cfg.show_fps) {
         char txt[64];
-        if (a->fps >= 0) snprintf(txt, sizeof txt, "3D %.0f fps  %.0f MIPS  tempo %.0f%%", a->fps, a->m->ips, a->tempo * 100);
-        else snprintf(txt, sizeof txt, "3D -  %.0f MIPS  tempo %.0f%%", a->m->ips, a->tempo * 100);
+        if (a->fps >= 0) snprintf(txt, sizeof txt, "speed %.0f%%  fps %.0f  CPU %.0f MIPS", a->tempo * 100, a->fps, a->m->ips);
+        else snprintf(txt, sizeof txt, "speed %.0f%%  fps -  CPU %.0f MIPS", a->tempo * 100, a->m->ips);
         int ww, wh; SDL_GetRenderOutputSize(a->ren, &ww, &wh);
         float x = ww / 2.0f - strlen(txt) * 8 - 8;
         SDL_SetRenderScale(a->ren, 2, 2);
