@@ -88,6 +88,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "[stats] %.0fms: vram %llu bytes/s, 3DA %llu/s, DAC %llu/s, int16 %llu/s joy %.1f/s FRAMES %.1f/s\n", dur, (unsigned long long)((m->cpu.vram_writes - w0) * 1000 / dur), (unsigned long long)((m->stat_3da - s0) * 1000 / dur), (unsigned long long)((m->stat_dac - d0) * 1000 / dur), (unsigned long long)((m->int_count[0x16] - i16) * 1000 / dur), (m->joy_triggers - j0) * 1000.0 / dur, (machine_frames(m) - f0) * 1000.0 / dur);
             }
             else if (!strcmp(e->cmd, "ticks")) { fprintf(stderr, "[ticks] t=%.0f raised=%llu lost=%llu wall=%.2fs\n", m->time_us/1000, (unsigned long long)m->ticks_raised, (unsigned long long)m->lost_ticks, (double)clock()/CLOCKS_PER_SEC); }
+            else if (!strcmp(e->cmd, "joy4")) { float x, y, x2, y2; int b = 0; sscanf(e->arg, "%f %f %f %f %d", &x, &y, &x2, &y2, &b); machine_joystick(m, x, y, x2, y2, b); }
             else if (!strcmp(e->cmd, "joy")) { float x, y; int b = 0; sscanf(e->arg, "%f %f %d", &x, &y, &b); machine_joystick(m, x, y, -2, -2, b); }
             else if (!strcmp(e->cmd, "key") || !strcmp(e->cmd, "down") || !strcmp(e->cmd, "up")) {
                 unsigned sc; char ext[8] = "";

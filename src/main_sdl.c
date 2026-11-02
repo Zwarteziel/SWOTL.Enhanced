@@ -131,7 +131,8 @@ static void config_write(const char *path, const Config *c) {
         "mips=%g\n"
         "; Ground detail 1-5\n"
         "detail=%d\n"
-        "; Advanced flight controls (rudder): 0 or 1\n"
+        "; Advanced flight controls: 0 or 1. The rudder (F5-F9, gamepad LB/RB or\n"
+        "; lt/rt=RUDDER) only works with 1.\n"
         "advanced=%d\n"
         "; Joystick: auto (on when a gamepad is connected at start, or with\n"
         "; keyboard_flight=stick), on, off\n"
@@ -208,7 +209,11 @@ static void config_write(const char *path, const Config *c) {
         fprintf(f, "%s=%s\n", pad_names[b], c->pad[b]);
     }
     fprintf(f,
-        "; triggers: repeated key presses while held (throttle)\n"
+        "; Triggers. A key (e.g. PLUS): repeated presses while pulled, faster when\n"
+        "; pulled further (throttle). KEY1/KEY2: held like a button. RUDDER: analog\n"
+        "; rudder, LT left and RT right (needs advanced=1); a slight pull gives a\n"
+        "; little rudder. To use the triggers for the rudder and the bumpers for the\n"
+        "; throttle: lt=RUDDER, rt=RUDDER, lb=MINUS, rb=PLUS.\n"
         "lt=%s\n"
         "rt=%s\n"
         "; right stick looks around in flight: 0 or 1\n"
@@ -319,7 +324,7 @@ static int sdl_to_xt(SDL_Scancode sc) {
     }
 }
 
-typedef struct { int mods; int key; int release_key; int joy; int release_mods; } Action;
+typedef struct { int mods; int key; int release_key; int joy; int release_mods; int rudder; } Action;
 
 static int key_by_name(const char *n) {
     static const struct { const char *name; int code; } t[] = {
@@ -355,6 +360,7 @@ static void parse_one(const char *s, int *mods, int *key, int *joy) {
 
 static Action parse_action(const char *s) {
     Action a; memset(&a, 0, sizeof a);
+    if (!SDL_strcasecmp(s, "RUDDER")) { a.rudder = 1; return a; } /* analog rudder (triggers) */
     char buf[32]; snprintf(buf, sizeof buf, "%s", s);
     char *slash = strchr(buf, '/');
     if (slash && slash != buf) {
@@ -381,6 +387,8 @@ typedef struct {
     int view_dir;          /* current right-stick view key */
     double lt_next, rt_next;
     int lt_down, rt_down;
+    int rudder_state;      /* rudder sent to the game: -2 hard left .. 0 centre .. 2 hard right */
+    int rudder_hint_shown;
     SDL_FRect dst;
     uint32_t *frame;
     int paused_focus;
@@ -767,6 +775,8 @@ static void ini_set(const char *path, const char *section, const char *key, cons
     if (f) { fwrite(out, 1, o, f); fclose(f); }
 }
 
+static void rudder_hint(App *a);
+
 /* A and B click the mouse in menus and on the map, and are the fire buttons in
  * flight. A release must go where the press went: leaving the map with A used
  * to leave the mouse button held (or the joystick button), and the aircraft
@@ -789,8 +799,65 @@ static void pad_button(App *a, int btn, int down) {
         if (down) b |= bit; else b &= ~bit;
         machine_mouse_buttons(a->m, b);
     } else {
+        int k = a->pad_act[btn].key;
+        if (down && k >= 0x3F && k <= 0x43 && machine_in_3d(a->m)) rudder_hint(a);
         do_action(a, &a->pad_act[btn], down);
     }
+}
+
+/* SWOTL only has rudder keys, and only with advanced flight controls:
+ * F5 hard left, F6 partial left, F9 centre, F7 partial right, F8 hard right.
+ * Measured in a P-51B over 6 s: partial rudder turns about 4 degrees, hard
+ * rudder about 76. An analog trigger is therefore turned into key presses:
+ * a slight pull gives partial rudder, further pulls switch between centre
+ * and hard rudder ten times a second with a duty cycle that follows the
+ * trigger (25% gives about 7 degrees, 50% about 23), and a full pull gives
+ * hard rudder. */
+static int game_advanced(App *a) {
+    if (a->cfg.args[0]) {
+        char t[8][16]; int n = sscanf(a->cfg.args, "%15s %15s %15s %15s %15s", t[0], t[1], t[2], t[3], t[4]);
+        return n >= 5 && (t[4][0] == 'Y' || t[4][0] == 'y');
+    }
+    return a->cfg.advanced;
+}
+
+static void rudder_hint(App *a) {
+    if (game_advanced(a) || a->rudder_hint_shown) return;
+    a->rudder_hint_shown = 1;
+    set_status(a, "Rudder needs advanced=1 in swotl-enhanced.ini");
+}
+
+static void update_rudder(App *a, float r, double now_ms, int menu) {
+    if (menu) return; /* not in flight: leave the rudder as it is */
+    const double period = 100.0;
+    float s = r < 0 ? -r : r;
+    int dir = r < 0 ? -1 : 1, want;
+    if (s < 0.08f) want = 0;
+    else if (s < 0.25f) want = 1;
+    else if (s > 0.95f) want = 2;
+    else want = SDL_fmod(now_ms, period) < s * period ? 2 : 0;
+    int state = want * dir;
+    if (state == a->rudder_state) return;
+    if (state) rudder_hint(a);
+    /* partial rudder steps from the current position, so centre first */
+    if (state == 1 || state == -1) tap(a, 0, 0x43);
+    static const int keys[5] = {0x3F, 0x40, 0x43, 0x41, 0x42}; /* F5 F6 F9 F7 F8 */
+    tap(a, 0, keys[state + 2]);
+    a->rudder_state = state;
+}
+
+/* A trigger set to a key: repeated presses while pulled (throttle). Set to
+ * KEY1/KEY2, it holds like a button: KEY1 when pulled, KEY2 when let go. */
+static void trigger(App *a, Action *act, float v, double *next, int *down, double now_ms) {
+    if (act->rudder || (!act->key && !act->joy)) return;
+    if (act->release_key || act->joy) {
+        int d = v > 0.3f;
+        if (d != *down) { *down = d; do_action(a, act, d); }
+        return;
+    }
+    if (v > 0.3f) {
+        if (now_ms >= *next) { tap(a, act->mods, act->key); *next = now_ms + 1000.0 / (a->cfg.key_rate * (0.5 + 0.5 * v)); }
+    } else *next = 0;
 }
 
 /* release everything the gamepad still holds (gamepad unplugged) */
@@ -816,10 +883,11 @@ static void poll_gamepad(App *a, double now_ms) {
     /* triggers: repeated taps while held */
     float lt = SDL_GetGamepadAxis(a->pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) / 32767.0f;
     float rt = SDL_GetGamepadAxis(a->pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) / 32767.0f;
-    if (lt > 0.3f) { if (now_ms >= a->lt_next) { tap(a, a->lt_act.mods, a->lt_act.key); a->lt_next = now_ms + 1000.0 / (a->cfg.key_rate * (0.5 + 0.5 * lt)); } }
-    else a->lt_next = 0;
-    if (rt > 0.3f) { if (now_ms >= a->rt_next) { tap(a, a->rt_act.mods, a->rt_act.key); a->rt_next = now_ms + 1000.0 / (a->cfg.key_rate * (0.5 + 0.5 * rt)); } }
-    else a->rt_next = 0;
+    trigger(a, &a->lt_act, lt, &a->lt_next, &a->lt_down, now_ms);
+    trigger(a, &a->rt_act, rt, &a->rt_next, &a->rt_down, now_ms);
+    /* analog rudder on the trigger(s) set to RUDDER: LT left, RT right */
+    float rud = (a->rt_act.rudder ? rt : 0.0f) - (a->lt_act.rudder ? lt : 0.0f);
+    if (a->lt_act.rudder || a->rt_act.rudder) update_rudder(a, rud, now_ms, menu);
     /* right stick: views */
     if (a->cfg.rstick_views && !menu) {
         float rx = axis(a, SDL_GAMEPAD_AXIS_RIGHTX), ry = axis(a, SDL_GAMEPAD_AXIS_RIGHTY);
@@ -1101,6 +1169,7 @@ int main(int argc, char **argv) {
                 if (e.key.repeat) break; /* the emulated BIOS repeats held keys itself */
                 if (handle_arrow(a, sc, down)) break;
                 int xt = sdl_to_xt(sc);
+                if (down && xt >= 0x3F && xt <= 0x43 && machine_in_3d(a->m)) rudder_hint(a);
                 if (xt) send_key(a, xt, down);
                 break;
             }

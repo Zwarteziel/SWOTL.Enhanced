@@ -1,6 +1,6 @@
 # SWOTL Enhanced
 
-Version 0.1.13
+Version 0.1.14
 
 Run **Secret Weapons of the Luftwaffe** (Lucasfilm Games, 1991) on modern Windows
 without installing DOSBox. You need your own copy of the original game files.
@@ -91,12 +91,24 @@ All other keys go to the game. See `SWOTL.DOC` for the game's own keys.
 | Y (hold) | Look back |
 | Right stick | Look around (keypad views) |
 | RT / LT | Throttle up / down |
-| RB / LB | Rudder right / left (advanced flight controls) |
+| RB / LB | Rudder right / left (needs `advanced=1`) |
 | D-pad | Flaps (up), gear (down), map (left), gun camera (right) |
 | Start | Pause (Alt+P) |
 | Back | Esc |
 
 You can change every button in the `[gamepad]` section of the ini file.
+
+**Rudder.** SWOTL has a rudder only with advanced flight controls: set
+`advanced=1` in `[game]`. Without it the rudder keys (F5-F9) do nothing, and a
+message in the window says so. LB and RB give full rudder while held and centre
+it when released. For an **analog rudder on the triggers**, set `lt=RUDDER` and
+`rt=RUDDER`, and move the throttle to the bumpers with `lb=MINUS` and `rb=PLUS`.
+The game itself only knows partial and full rudder, so SWOTL Enhanced turns the
+trigger into rudder key presses: a slight pull gives partial rudder, a further
+pull switches between centre and full rudder ten times a second in the ratio of
+the pull, and a full pull gives full rudder. In a P-51B over 6 seconds, a 15%
+pull turns about 4 degrees, 50% about 35 and a full pull about 76.
+Triggers can also take `KEY1/KEY2` (held like a button, e.g. `lt=F5/F9`).
 
 **Stick response.** By default the left stick is linear, just like a joystick
 from 1991. `stick_curve` (1.0 to 3.0) bends the response: small movements

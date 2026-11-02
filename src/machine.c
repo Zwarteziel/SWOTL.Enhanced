@@ -614,7 +614,8 @@ void machine_run(Machine *m, double us) {
     if (m->time_us - m->sig_scan_us > 1e6) {
         /* push bp; mov bp,sp; push ds; mov cs:[xxxx],ds; mov word cs:[xxxx],0;
          * push si; push di; cld. The xxxx offsets differ between game
-         * versions (1991: 330C/330E, 1993 release: 35DC/35DE). */
+         * versions (1991: 330C/330E; the later release in LucasArts Air Combat
+         * Classics: 35DC/35DE). */
         static const uint8_t sig[] = {0x55, 0x8B, 0xEC, 0x1E, 0x2E, 0x8C, 0x1E, 0x00, 0x00, 0x2E, 0xC7, 0x06, 0x00, 0x00, 0x00, 0x00, 0x56, 0x57, 0xFC};
         static const uint8_t any[sizeof sig] = {0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0};
         m->sig_scan_us = m->time_us;
