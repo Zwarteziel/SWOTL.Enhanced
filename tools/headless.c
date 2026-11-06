@@ -6,9 +6,12 @@
  *                <ms> type <text>
  *                <ms> shot <name>
  *                <ms> mouse <x0..1> <y0..1>
- *                <ms> click <buttons> */
+ *                <ms> click <buttons>
+ *                <ms> hires 1|0             (experimental high-res 3D view)
+ *                <ms> hshot <name> <n>      (screenshot at 320n x 200n) */
 #include "../src/machine.h"
 #include "../src/hle.h"
+#include "../src/hires.h"
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
@@ -35,6 +38,26 @@ static void shot(Machine *m, const char *name) {
     for (int i = 0; i < w * h; i++) { uint32_t p = buf[i]; fputc(p & 255, f); fputc((p >> 8) & 255, f); fputc((p >> 16) & 255, f); }
     fclose(f);
     fprintf(stderr, "[shot] %s (%dx%d) mode %02X t=%.0fms CS:IP=%04X:%04X\n", fn, w, h, m->vmode, m->time_us / 1000, m->cpu.s[CS], m->cpu.ip);
+}
+
+static void hshot(Machine *m, const char *arg) {
+    char name[128]; int n = 4;
+    if (sscanf(arg, "%127s %d", name, &n) < 1) return;
+    uint32_t *buf = malloc((size_t)320 * n * 200 * n * 4);
+    clock_t t0 = clock();
+    int ok = 0;
+    for (int i = 0; i < 10; i++) ok = machine_render_hires(m, n, buf);
+    double ms = (double)(clock() - t0) * 1000.0 / CLOCKS_PER_SEC / 10;
+    if (ok) {
+        char fn[256]; snprintf(fn, sizeof fn, "%s.ppm", name);
+        FILE *f = fopen(fn, "wb");
+        fprintf(f, "P6 %d %d 255\n", 320 * n, 200 * n);
+        for (int i = 0; i < 320 * n * 200 * n; i++) { uint32_t p = buf[i]; fputc(p & 255, f); fputc((p >> 8) & 255, f); fputc((p >> 16) & 255, f); }
+        fclose(f);
+    }
+    if (m->hires) hires_debug(m->hires, m, stderr);
+    fprintf(stderr, "[hshot] %s n=%d %s state='%s' t=%.0fms compose %.2f ms\n", name, n, ok ? "ok" : "not available", machine_hires_state(m), m->time_us / 1000, ms);
+    free(buf);
 }
 
 int main(int argc, char **argv) {
@@ -67,6 +90,8 @@ int main(int argc, char **argv) {
         while (ei < nev && ev[ei].t <= t) {
             Ev *e = &ev[ei++];
             if (!strcmp(e->cmd, "shot")) shot(m, e->arg);
+            else if (!strcmp(e->cmd, "hires")) machine_set_hires(m, atoi(e->arg));
+            else if (!strcmp(e->cmd, "hshot")) hshot(m, e->arg);
             else if (!strcmp(e->cmd, "fps")) {
                 /* sample the framebuffer every 2 ms for N ms and count changes */
                 double dur = atof(e->arg); uint32_t last = 0; int changes = 0; uint32_t b0 = m->cpu.vram_blits, by0 = m->cpu.vram_bytes;

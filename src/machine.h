@@ -10,6 +10,8 @@
 #define MAX_FILES 40
 #define AUDIO_RING 32768
 
+struct Hires;
+
 typedef struct Machine {
     CPU cpu;
     uint8_t *mem;
@@ -112,6 +114,9 @@ typedef struct Machine {
     /* BIOS-style key repeat (typematic) for the most recently pressed key */
     int typ_code;            /* scancode | 0x100 for E0 keys, 0 = none */
     double typ_next_us, typ_rate_hz, typ_delay_us;
+
+    /* experimental high-resolution 3D view (NULL = off) */
+    struct Hires *hires;
 } Machine;
 
 Machine *machine_create(const char *gamedir, const char *exe, const char *args);
@@ -140,5 +145,13 @@ uint64_t machine_frames(Machine *m);
  * 3D frame in the last half second. The game also polls the mouse in flight
  * (mouse flying), so mouse polling cannot tell menus from flight. */
 int machine_in_3d(Machine *m);
+
+/* Experimental high-resolution 3D view: on/off. */
+void machine_set_hires(Machine *m, int on);
+/* Draws the screen at 320*n x 200*n into out when the 3D view can be redrawn
+ * at that resolution; returns 0 otherwise (use machine_render). */
+int machine_render_hires(Machine *m, int n, uint32_t *out);
+/* "" when working or off, otherwise a short reason */
+const char *machine_hires_state(Machine *m);
 
 #endif

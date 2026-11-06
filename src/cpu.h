@@ -50,11 +50,20 @@ struct CPU {
     uint64_t vram_writes;       /* bytes written to the VGA window */
     uint32_t watch_lin;         /* linear address to count executions of */
     uint64_t watch_hits;
+    void (*watch_hook)(void *host, CPU *c); /* called before that instruction */
+    /* breakpoints: bp_hook is called before any instruction in segment bp_cs
+     * whose offset has its bit set in bp_map (8 KB). bp_cs = 0: none. */
+    uint16_t bp_cs;
+    const uint8_t *bp_map;
+    void (*bp_hook)(void *host, CPU *c);
 };
 
 void cpu_reset(CPU *c);
 /* Execute up to n instructions; returns number executed. */
 int cpu_run(CPU *c, int n);
+/* Execute exactly one instruction, without interrupts or hooks (used to run a
+ * game routine on the side; the caller saves and restores the state). */
+void cpu_step(CPU *c);
 /* Raise a software/hardware interrupt now (pushes flags, cs, ip). */
 void cpu_interrupt(CPU *c, uint8_t num);
 

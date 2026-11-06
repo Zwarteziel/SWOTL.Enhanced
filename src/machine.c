@@ -1,6 +1,7 @@
 /* SWOTL Enhanced - emulated PC hardware and timing. GPL-3.0-or-later. */
 #include "machine.h"
 #include "hle.h"
+#include "hires.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
@@ -619,6 +620,7 @@ void machine_run(Machine *m, double us) {
         static const uint8_t sig[] = {0x55, 0x8B, 0xEC, 0x1E, 0x2E, 0x8C, 0x1E, 0x00, 0x00, 0x2E, 0xC7, 0x06, 0x00, 0x00, 0x00, 0x00, 0x56, 0x57, 0xFC};
         static const uint8_t any[sizeof sig] = {0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0};
         m->sig_scan_us = m->time_us;
+        if (m->hires) hires_scan(m->hires, m, machine_in_3d(m));
         uint32_t w = m->cpu.watch_lin;
         if (!w || !sig_match(m->mem + w, sig, any, sizeof sig)) {
             m->cpu.watch_lin = 0;
@@ -629,6 +631,35 @@ void machine_run(Machine *m, double us) {
 }
 
 uint64_t machine_frames(Machine *m) { return m->cpu.watch_hits; }
+
+static void on_present(void *host, CPU *c) {
+    Machine *m = host;
+    if (m->hires) hires_present(m->hires, m, c);
+}
+
+static void on_breakpoint(void *host, CPU *c) {
+    Machine *m = host;
+    if (m->hires) hires_breakpoint(m->hires, m, c);
+}
+
+void machine_set_hires(Machine *m, int on) {
+    if (on && !m->hires) {
+        m->hires = hires_create();
+        if (m->hires) hires_scan(m->hires, m, 0);
+    } else if (!on && m->hires) {
+        hires_detach(m->hires, m);
+        hires_destroy(m->hires);
+        m->hires = NULL;
+    }
+}
+
+int machine_render_hires(Machine *m, int n, uint32_t *out) {
+    return m->hires ? hires_compose(m->hires, m, n, out) : 0;
+}
+
+const char *machine_hires_state(Machine *m) {
+    return m->hires ? hires_state(m->hires) : "";
+}
 
 int machine_in_3d(Machine *m) {
     if (m->cpu.watch_hits != m->frames_seen) { m->frames_seen = m->cpu.watch_hits; m->last_frame_us = m->time_us; }
@@ -707,6 +738,8 @@ Machine *machine_create(const char *gamedir, const char *exe, const char *args) 
     m->cpu.vga_rd = vga_rd;
     m->cpu.vga_wr = vga_wr;
     cpu_reset(&m->cpu);
+    m->cpu.watch_hook = on_present;
+    m->cpu.bp_hook = on_breakpoint;
     m->pic_imr = 0xB8; /* timer, keyboard, cascade, mouse unmasked */
     m->pit_rw[0] = 3; m->pit_mode[0] = 3;
     m->next_irq0_us = pit_period_us(m, 0);
@@ -736,6 +769,7 @@ void machine_set_audio_rate(Machine *m, int rate) {
 void machine_destroy(Machine *m) {
     if (!m) return;
     for (int i = 0; i < MAX_FILES; i++) if (m->files[i]) fclose(m->files[i]);
+    if (m->hires) hires_destroy(m->hires);
     free(m->vram);
     free(m->mem);
     free(m);

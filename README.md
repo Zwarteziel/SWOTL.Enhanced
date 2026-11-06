@@ -1,6 +1,6 @@
 # SWOTL Enhanced
 
-Version 0.1.14
+Version 0.1.15
 
 Run **Secret Weapons of the Luftwaffe** (Lucasfilm Games, 1991) on modern Windows
 without installing DOSBox. You need your own copy of the original game files.
@@ -75,6 +75,7 @@ comments in the file are not carried over.
 | Ctrl+F11 / Ctrl+F12 | Lower / raise the CPU speed limit |
 | Ctrl+F9 | Show speed, frame rate and CPU speed in the picture (they are always in the title bar) |
 | Ctrl+F6 | CRT shader on/off (saved in the ini file) |
+| Ctrl+F4 | High-resolution 3D view on/off (experimental, saved in the ini file) |
 | Ctrl+F7 / Ctrl+F8 | Make the gamepad stick less / more curved (saved in the ini file) |
 | Ctrl+F5 | Start / stop a diagnostic recording (`swotl-rec-NNNN.avi` + `.log`, max 60 s) |
 
@@ -150,6 +151,29 @@ years supports. If OpenGL does not work, the program falls back to its normal
 renderer without the effect, and writes the reason to
 `swotl-enhanced-gl.log`. `renderer=sdl` always uses the normal renderer.
 
+## High-resolution 3D view (experimental)
+
+With `hires=4` (or Ctrl+F4) the 3D view from the cockpit is drawn at 1280x800
+instead of 320x200. The ground, rivers, villages, roads and buildings get
+smooth edges; the cockpit, aircraft, smoke and explosions stay as the game
+draws them, scaled up. `hires=2` and `hires=3` give 640x400 and 960x600.
+
+How it works: the game still draws its own picture at 320x200. SWOTL Enhanced
+watches the routines that draw the ground polygons, roads and buildings, and
+draws the same shapes again at the higher resolution. Each corner point is
+computed a second time, with more precision, by running the game's own
+projection routine again on the side with a four times larger focal length.
+Anything it does not recognise is taken from the game's own picture.
+
+Limits of this first version:
+- Only for the later release of the game (LucasArts Air Combat Classics). With
+  the 1991 release the setting has no effect and a message says so.
+- Only the forward view from the cockpit. The side, rear and up views, the
+  map and the menus are shown as before.
+- The horizon itself stays at the original resolution.
+- The CRT shader is off while the high-resolution view is on.
+- It costs about 10% more CPU time for the emulation.
+
 ## Settings (`swotl-enhanced.ini`)
 
 - `mips`: the highest emulated CPU speed. The default is 40. About 20 is a fast
@@ -165,6 +189,8 @@ renderer without the effect, and writes the reason to
 - `volume`
 - `shader`: `crt-auto` (default), `crt-1080p`, `crt-1440p`, `crt-4k` or `none`.
 - `renderer`: `opengl` (default, needed for the shader) or `sdl`.
+- `hires`: experimental high-resolution 3D view: `0` (off, default), `2`, `3`
+  or `4`. See above.
 - `scale`, `aspect`, `integer`, `fullscreen`, `width`, `height`. `scale` and
   `integer` apply when no CRT shader is active.
 - `mouse_speed`

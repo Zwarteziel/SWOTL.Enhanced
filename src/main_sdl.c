@@ -42,6 +42,7 @@ typedef struct {
     int show_fps;
     int shader;          /* SHADER_* (crt_gl.h) */
     int renderer_sdl;    /* 1 = SDL renderer (no shaders) */
+    int hires;           /* experimental high-resolution 3D view: 0 off, 2..4 = factor */
     char pad[32][32];    /* gamepad button mapping strings, by SDL_GamepadButton */
     char pad_lt[32], pad_rt[32];
     int rstick_views;
@@ -187,11 +188,17 @@ static void config_write(const char *path, const Config *c) {
         "mouse_speed=%g\n"
         "; show speed, frame rate and CPU speed in the picture (Ctrl+F9 toggles);\n"
         "; they are always in the title bar\n"
-        "show_fps=%d\n\n",
+        "show_fps=%d\n"
+        "; hires (experimental): draw the 3D view (ground, roads, buildings) at a\n"
+        "; higher resolution: 0 = off, 2, 3 or 4 = 640x400, 960x600 or 1280x800.\n"
+        "; Aircraft, smoke and the cockpit stay as the game draws them. Only for\n"
+        "; the later release of the game (Air Combat Classics); the CRT shader is\n"
+        "; off while it is on. Ctrl+F4 switches between off and 4.\n"
+        "hires=%d\n\n",
         c->fullscreen, c->width, c->height, shader_to_str(c->shader),
         c->renderer_sdl ? "sdl" : "opengl",
         c->scale_mode == 0 ? "nearest" : (c->scale_mode == 1 ? "linear" : "sharp"),
-        c->aspect, c->integer_only, c->mouse_speed, c->show_fps);
+        c->aspect, c->integer_only, c->mouse_speed, c->show_fps, c->hires);
     fprintf(f,
         "[gamepad]\n"
         "; Left stick = joystick. Right stick = look around (numeric keypad views).\n"
@@ -268,6 +275,7 @@ static void config_load(Config *cfg, const char *path) {
             else if (!strcmp(k, "show_fps")) cfg->show_fps = atoi(v);
             else if (!strcmp(k, "shader")) cfg->shader = shader_from_str(v);
             else if (!strcmp(k, "renderer")) cfg->renderer_sdl = !SDL_strcasecmp(v, "sdl");
+            else if (!strcmp(k, "hires")) { int n = atoi(v); cfg->hires = n <= 0 ? 0 : (n == 1 ? 4 : (n > 4 ? 4 : n)); }
         } else if (!strcmp(section, "gamepad")) {
             if (!strcmp(k, "lt")) snprintf(cfg->pad_lt, sizeof cfg->pad_lt, "%s", v);
             else if (!strcmp(k, "rt")) snprintf(cfg->pad_rt, sizeof cfg->pad_rt, "%s", v);
@@ -412,6 +420,8 @@ typedef struct {
     CrtGL *gl;             /* OpenGL presentation (CRT shaders); NULL = SDL renderer */
     const char *shader_name;
     int frames_presented;
+    uint32_t *hframe;      /* high-resolution picture, up to 1280x800 */
+    int hires_told;        /* "not supported" message shown */
     char gl_error[512];
 } App;
 
@@ -498,11 +508,12 @@ static void gl_text_box(App *a, int x, int y, const char *txt, uint32_t col) {
     crtgl_overlay(a->gl, buf, bw, bh, x * 2, y * 2, 2);
 }
 
-static void present_gl(App *a, int w, int h) {
-    const char *nm = crtgl_frame(a->gl, a->frame, w, h, a->cfg.shader, a->cfg.scale_mode,
+static void present_gl(App *a, const uint32_t *img, int w, int h) {
+    int shader = a->cfg.hires ? SHADER_NONE : a->cfg.shader;
+    const char *nm = crtgl_frame(a->gl, img, w, h, shader, a->cfg.scale_mode,
                                  a->cfg.aspect, a->cfg.integer_only, &a->dst);
     if (nm[0] && nm != a->shader_name) {
-        if (a->shader_name && a->cfg.shader != SHADER_NONE) {
+        if (a->shader_name && shader != SHADER_NONE) {
             char msg[96]; snprintf(msg, sizeof msg, "Display: %s", nm);
             set_status(a, msg);
         }
@@ -549,7 +560,11 @@ static void present_gl(App *a, int w, int h) {
 static void present(App *a) {
     int w, h;
     if (!machine_render(a->m, a->frame, &w, &h)) return;
-    if (a->gl) { present_gl(a, w, h); return; }
+    const uint32_t *img = a->frame;
+    if (a->cfg.hires && a->hframe && machine_render_hires(a->m, a->cfg.hires, a->hframe)) {
+        img = a->hframe; w = 320 * a->cfg.hires; h = 200 * a->cfg.hires;
+    }
+    if (a->gl) { present_gl(a, img, w, h); return; }
     if (!a->tex || w != a->tex_w || h != a->tex_h) {
         if (a->tex) SDL_DestroyTexture(a->tex);
         if (a->sharp) { SDL_DestroyTexture(a->sharp); a->sharp = NULL; }
@@ -558,7 +573,7 @@ static void present(App *a) {
         a->tex_w = w; a->tex_h = h;
         update_layout(a);
     }
-    SDL_UpdateTexture(a->tex, NULL, a->frame, w * 4);
+    SDL_UpdateTexture(a->tex, NULL, img, w * 4);
     SDL_SetRenderDrawColor(a->ren, 0, 0, 0, 255);
     SDL_RenderClear(a->ren);
     if (a->cfg.scale_mode == 2) {
@@ -1066,6 +1081,8 @@ int main(int argc, char **argv) {
     a->m->typ_rate_hz = a->cfg.key_rate;
     a->m->typ_delay_us = a->cfg.key_delay * 1000.0;
     a->frame = calloc(640 * 480, 4);
+    a->hframe = calloc(1280 * 800, 4);
+    machine_set_hires(a->m, a->cfg.hires > 0);
     a->fps = -1;
     a->fps_t0 = SDL_GetTicks();
     update_title(a);
@@ -1090,7 +1107,27 @@ int main(int argc, char **argv) {
     static int16_t abuf[8192 * 2];
     double load_avg = 0.5;
     double debug_after = getenv("SWOTL_DEBUG_SHOT") ? atof(getenv("SWOTL_DEBUG_SHOT")) : 0;
+    /* test hook: scripted input in emulated time, lines "<ms> key <hex>" or
+     * "<ms> joy <x> <y>" */
+    struct { double t; int key; float x, y; } dbg_ev[64]; int dbg_n = 0, dbg_i = 0, dbg_up = 0; double dbg_up_t = 0;
+    if (getenv("SWOTL_DEBUG_SCRIPT")) {
+        FILE *sf = fopen(getenv("SWOTL_DEBUG_SCRIPT"), "r");
+        char ln[128];
+        while (sf && dbg_n < 64 && fgets(ln, sizeof ln, sf)) {
+            double t; char cmd[16]; unsigned k; float x, y;
+            if (sscanf(ln, "%lf %15s", &t, cmd) != 2) continue;
+            if (!strcmp(cmd, "key") && sscanf(ln, "%*f %*s %x", &k) == 1) { dbg_ev[dbg_n].t = t; dbg_ev[dbg_n].key = (int)k; dbg_n++; }
+            else if (!strcmp(cmd, "joy") && sscanf(ln, "%*f %*s %f %f", &x, &y) == 2) { dbg_ev[dbg_n].t = t; dbg_ev[dbg_n].key = -1; dbg_ev[dbg_n].x = x; dbg_ev[dbg_n].y = y; dbg_n++; }
+        }
+        if (sf) fclose(sf);
+    }
     while (running && !a->m->exited) {
+        if (dbg_up && a->m->time_us / 1000 >= dbg_up_t) { machine_key(a->m, dbg_up, 0, 0); dbg_up = 0; }
+        if (dbg_i < dbg_n && !dbg_up && a->m->time_us / 1000 >= dbg_ev[dbg_i].t) {
+            if (dbg_ev[dbg_i].key >= 0) { machine_key(a->m, dbg_ev[dbg_i].key, 0, 1); dbg_up = dbg_ev[dbg_i].key; dbg_up_t = a->m->time_us / 1000 + 80; }
+            else machine_joystick(a->m, dbg_ev[dbg_i].x, dbg_ev[dbg_i].y, -2, -2, 0);
+            dbg_i++;
+        }
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             switch (e.type) {
@@ -1158,6 +1195,18 @@ int main(int argc, char **argv) {
                             a->shader_name = NULL;
                             set_status(a, a->cfg.shader != SHADER_NONE ? "CRT shader on: crt-auto (saved)" : "CRT shader off (saved)");
                         }
+                        send_key(a, 0x1D, 0);
+                    }
+                    break;
+                }
+                if (sc == SDL_SCANCODE_F4 && (e.key.mod & SDL_KMOD_CTRL)) {
+                    if (down && !e.key.repeat) {
+                        a->cfg.hires = a->cfg.hires ? 0 : 4;
+                        machine_set_hires(a->m, a->cfg.hires > 0);
+                        ini_set(a->ini_path, "display", "hires", a->cfg.hires ? "4" : "0");
+                        a->shader_name = NULL;
+                        a->hires_told = 0;
+                        set_status(a, a->cfg.hires ? "High-resolution 3D on (experimental, saved)" : "High-resolution 3D off (saved)");
                         send_key(a, 0x1D, 0);
                     }
                     break;
@@ -1264,6 +1313,11 @@ int main(int argc, char **argv) {
             a->tempo_emu0 = a->m->time_us;
             a->fps_frames = f; a->fps_t0 = tnow;
             update_title(a);
+            const char *hs = machine_hires_state(a->m);
+            if (a->cfg.hires && !a->hires_told && !strcmp(hs, "game version not supported")) {
+                set_status(a, "High-resolution 3D: not available for this game release");
+                a->hires_told = 1;
+            }
         }
         if (getenv("SWOTL_DEBUG_REC")) { /* test hook: record from 8 s to 11 s */
             Uint64 tk = SDL_GetTicks();

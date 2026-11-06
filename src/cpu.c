@@ -688,11 +688,17 @@ static void step(CPU *c) {
     }
 }
 
+void cpu_step(CPU *c) { step(c); }
+
 int cpu_run(CPU *c, int n) {
     int i;
     for (i = 0; i < n && !c->halted; i++) {
         c->inhibit_irq = 0;
-        if (c->watch_lin && ((uint32_t)c->s[CS] << 4) + c->ip == c->watch_lin) c->watch_hits++;
+        if (c->watch_lin && ((uint32_t)c->s[CS] << 4) + c->ip == c->watch_lin) {
+            c->watch_hits++;
+            if (c->watch_hook) c->watch_hook(c->host, c);
+        }
+        if (c->bp_cs && c->s[CS] == c->bp_cs && (c->bp_map[c->ip >> 3] >> (c->ip & 7) & 1)) c->bp_hook(c->host, c);
         step(c);
         c->icount++;
         if (c->inhibit_irq) { i--; continue; }

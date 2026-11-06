@@ -1,0 +1,705 @@
+/* SWOTL Enhanced - experimental high-resolution 3D view. GPL-3.0-or-later.
+ *
+ * Addresses below are offsets in the resident code segment of SWOTL.EXE of
+ * the later release (LucasArts Air Combat Classics). They are only used after
+ * the bytes at each of them have been checked. Notes on how they were found
+ * are in the project documentation.
+ *
+ *   6667  projection: [22BA],[22BE],[22C2] -> screen x [22DE] (32 bit) and
+ *         y [22E2] (32 bit, pointing up). Focal length 180 is loaded as an
+ *         immediate at 6667 and 669B. Called from 663C, 8A88 and 8C68.
+ *   7FB2  adds one polygon edge to the edge table of the scanline renderer;
+ *         end points in [2366]/[2364], [23FF]/[23FD], [236A]/[2368],
+ *         [236E]/[236C]; colour [23D9]; polygon number [252F].
+ *   7621  scanline renderer: draws all edges added since the last call.
+ *   7B42  draws one polygon directly (houses, bridges); vertex list (x32,
+ *         y32) at DS:arg0, count = arg2 >> 4; at 7BBF it is known to be drawn.
+ *   8CEC  draws a line (roads) from vertex arg0 to arg0+1 of the list at
+ *         DS:2445; colour in [252B] at 8D26.
+ *   [2591] height of the 3D view in rows, [2593] row of y = 0 minus one. */
+#include "hires.h"
+#include "machine.h"
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+#define MAX_EDGES 4096
+#define MAX_VERTS 8192
+#define MAX_ITEMS 2048
+#define HASH_SIZE 4096
+#define VIEW_MAX 200
+
+enum { IT_GROUND, IT_LINE, IT_POLY };
+
+typedef struct { float x1, y1, x2, y2; int32_t ix1, iy1, ix2, iy2; uint16_t ord; uint8_t col; } HEdge;
+typedef struct { uint8_t type, col; uint16_t n; uint32_t first; } HItem;
+typedef struct { float x, y; } HVert;
+
+typedef struct {
+    HEdge edges[MAX_EDGES]; int ne;
+    HVert verts[MAX_VERTS]; int nv;
+    HItem items[MAX_ITEMS]; int ni;
+    uint8_t buf[320 * VIEW_MAX];
+    int vh;              /* rows of the 3D view */
+    float bot;           /* buffer row = bot - y */
+    double time_us;
+    uint64_t serial;
+    /* pixels written by the scanline renderer (the visible ground), at the
+     * game's resolution, for buffer segment gseg */
+    uint8_t gmask[320 * VIEW_MAX];
+    uint16_t gseg;
+} HFrame;
+
+typedef struct { int32_t x, y; float fx, fy; uint32_t gen; } HSlot;
+
+struct Hires {
+    int found;           /* 1 = routines found, -1 = not supported, 0 = not yet */
+    uint16_t cs;
+    uint16_t ds;
+    uint8_t bpmap[8192];
+    HFrame fr[2];
+    int cur;             /* frame being captured */
+    int ready;           /* index of the last complete frame, -1 = none */
+    int pass_start;      /* first edge of the current ground pass */
+    int pending_poly;    /* item index of a polygon waiting for 7BBF */
+    int pending_line;    /* item index of a line waiting for its colour */
+    HSlot hash[HASH_SIZE];
+    uint32_t gen;
+    uint8_t save_vars[0x600], save_stack[512], save_code[12];
+    uint64_t serial;
+    /* compose scratch; hidx holds the redrawn view of frame hidx_serial */
+    uint8_t *hidx; size_t hidx_size;
+    uint64_t hidx_serial; int hidx_n;
+    uint8_t skip[MAX_ITEMS];
+    uint16_t bufseg[2];  /* the two 3D buffers the game alternates between */
+    uint8_t snap[2][320 * VIEW_MAX];
+    int snap_rows;
+    uint8_t kind1[320 * VIEW_MAX], base1[320 * VIEW_MAX], exp1[320 * VIEW_MAX], bg1[320 * VIEW_MAX], other1[320 * VIEW_MAX];
+};
+
+static const struct { uint16_t off; uint8_t len; uint8_t b[12]; } sigs[] = {
+    {0x6667, 10, {0xC7, 0x06, 0xD8, 0x22, 0xB4, 0x00, 0xA1, 0xBA, 0x22, 0xE8}},
+    {0x669B, 9, {0xC7, 0x06, 0xD8, 0x22, 0xB4, 0x00, 0xA1, 0xBE, 0x22}},
+    {0x663C, 3, {0xE8, 0x28, 0x00}},
+    {0x8A88, 3, {0xE8, 0xDC, 0xDB}},
+    {0x8C68, 3, {0xE8, 0xFC, 0xD9}},
+    {0x7FB2, 8, {0xF7, 0x06, 0x6C, 0x23, 0xFF, 0xFF, 0x78, 0x0C}},
+    {0x7621, 11, {0x55, 0x8B, 0xEC, 0x57, 0x56, 0x06, 0x33, 0xC0, 0xA3, 0x31, 0x25}},
+    {0x7B42, 12, {0x55, 0x8B, 0xEC, 0x57, 0x56, 0x8B, 0x46, 0x08, 0xF7, 0x06, 0x81, 0x25}},
+    {0x7BB4, 11, {0xF7, 0x06, 0x0D, 0x24, 0xFF, 0xFF, 0x79, 0x03, 0xE9, 0xF3, 0x02}},
+    {0x8CEC, 12, {0x55, 0x8B, 0xEC, 0x57, 0x56, 0x8B, 0x5E, 0x08, 0xF7, 0x06, 0x81, 0x25}},
+    {0x8D26, 3, {0xBE, 0x45, 0x24}},
+    {0x7693, 8, {0x07, 0x5E, 0x5F, 0xA1, 0xFF, 0x23, 0x5D, 0xCB}},
+};
+static const uint16_t bps[] = {0x663F, 0x8A8B, 0x8C6B, 0x7FB2, 0x7621, 0x7B42, 0x7BBF, 0x8CEC, 0x8D26, 0x769A};
+
+Hires *hires_create(void) {
+    Hires *h = calloc(1, sizeof *h);
+    if (!h) return NULL;
+    h->ready = -1;
+    h->gen = 1;
+    h->pending_poly = h->pending_line = -1;
+    for (size_t i = 0; i < sizeof bps / sizeof bps[0]; i++) h->bpmap[bps[i] >> 3] |= (uint8_t)(1 << (bps[i] & 7));
+    return h;
+}
+
+void hires_destroy(Hires *h) {
+    if (!h) return;
+    free(h->hidx);
+    free(h);
+}
+
+const char *hires_state(Hires *h) {
+    if (!h) return "";
+    if (h->found < 0) return "game version not supported";
+    if (h->found == 0) return "waiting for flight";
+    return "";
+}
+
+static void attach(Hires *h, Machine *m) {
+    m->cpu.bp_map = h->bpmap;
+    m->cpu.bp_cs = h->cs;
+}
+
+int hires_scan(Hires *h, Machine *m, int in_3d) {
+    if (h->found > 0) {
+        /* still there? (the overlay manager may move code) */
+        uint32_t base = (uint32_t)h->cs << 4;
+        if (!memcmp(m->mem + base + sigs[0].off, sigs[0].b, sigs[0].len)) return 1;
+        h->found = 0; m->cpu.bp_cs = 0;
+    }
+    if (h->found < 0) return 0;
+    for (uint32_t a = 0x6667; a < 0x9F000; a += 16) {
+        if (m->mem[a] != 0xC7 || memcmp(m->mem + a, sigs[0].b, sigs[0].len)) continue;
+        uint32_t base = a - 0x6667;
+        int ok = 1;
+        for (size_t i = 1; i < sizeof sigs / sizeof sigs[0] && ok; i++)
+            if (memcmp(m->mem + base + sigs[i].off, sigs[i].b, sigs[i].len)) ok = 0;
+        if (!ok) continue;
+        h->cs = (uint16_t)(base >> 4);
+        h->found = 1;
+        attach(h, m);
+        return 1;
+    }
+    /* flying, but the routines are not there: another release of the game */
+    if (in_3d) h->found = -1;
+    return 0;
+}
+
+void hires_detach(Hires *h, Machine *m) {
+    (void)h;
+    m->cpu.bp_cs = 0;
+}
+
+/* ------------------------------------------------------------- capture */
+static inline uint16_t rw(const uint8_t *mem, uint32_t a) { return (uint16_t)(mem[a] | mem[a + 1] << 8); }
+static inline int32_t rd32(const uint8_t *mem, uint32_t a) { return (int32_t)(rw(mem, a) | (uint32_t)rw(mem, a + 2) << 16); }
+static inline void ww(uint8_t *mem, uint32_t a, uint16_t v) { mem[a] = (uint8_t)v; mem[a + 1] = (uint8_t)(v >> 8); }
+
+static uint32_t hkey(int32_t x, int32_t y) { return ((uint32_t)x * 73856093u ^ (uint32_t)y * 19349663u) & (HASH_SIZE - 1); }
+
+static void hash_put(Hires *h, int32_t x, int32_t y, float fx, float fy) {
+    uint32_t k = hkey(x, y);
+    for (int i = 0; i < 64; i++) {
+        HSlot *s = &h->hash[(k + i) & (HASH_SIZE - 1)];
+        if (s->gen != h->gen || (s->x == x && s->y == y)) { s->gen = h->gen; s->x = x; s->y = y; s->fx = fx; s->fy = fy; return; }
+    }
+}
+
+/* the precise position of a projected point, or the game's own value */
+static HVert lookup(Hires *h, int32_t x, int32_t y) {
+    uint32_t k = hkey(x, y);
+    for (int i = 0; i < 64; i++) {
+        HSlot *s = &h->hash[(k + i) & (HASH_SIZE - 1)];
+        if (s->gen != h->gen) break;
+        if (s->x == x && s->y == y) return (HVert){s->fx, s->fy};
+    }
+    /* the game truncates y down by about half a pixel */
+    return (HVert){(float)x, (float)y + 0.5f};
+}
+
+#define SB_N 4
+
+/* Runs the projection routine 6667 again with focal length 180*SB_N on the
+ * current inputs, and stores the result, scaled back, for the point the
+ * game has just computed. The CPU state and the memory it touches are
+ * restored afterwards, so the game does not notice. */
+static void rerun_projection(Hires *h, Machine *m, CPU *c) {
+    uint8_t *mem = m->mem;
+    uint32_t ds = (uint32_t)c->s[DS] << 4, cs = (uint32_t)c->s[CS] << 4, ss = (uint32_t)c->s[SS] << 4;
+    uint16_t ip = c->ip;
+    int32_t x1 = rd32(mem, ds + 0x22DE), y1 = rd32(mem, ds + 0x22E2);
+    const int N = SB_N;
+
+    CPU save = *c;
+    uint32_t sp0 = ss + (uint16_t)(c->r[SP] - 256);
+    if (ds + 0x2800 > MEM_SIZE || sp0 + 512 > MEM_SIZE) return;
+    memcpy(h->save_vars, mem + ds + 0x2200, sizeof h->save_vars);
+    memcpy(h->save_stack, mem + sp0, sizeof h->save_stack);
+    memcpy(h->save_code, mem + cs + 0x6667, 6);
+    memcpy(h->save_code + 6, mem + cs + 0x669B, 6);
+
+    double cx = (int16_t)rw(mem, ds + 0x2587) + (int16_t)rw(mem, ds + 0x2310);
+    double cy = -(double)(int16_t)rw(mem, ds + 0x2314) + (int16_t)rw(mem, ds + 0x2595) + (int16_t)rw(mem, ds + 0x2312);
+    /* focal length and range limits */
+    ww(mem, cs + 0x6667 + 4, 180 * N);
+    ww(mem, cs + 0x669B + 4, 180 * N);
+    uint32_t l8f = (uint32_t)rw(mem, ds + 0x258F) * N, l99 = (uint32_t)rw(mem, ds + 0x2599) * N;
+    ww(mem, ds + 0x258F, (uint16_t)(l8f > 0xFFFF ? 0xFFFF : l8f));
+    ww(mem, ds + 0x2599, (uint16_t)(l99 > 0x7FFF ? 0x7FFF : l99));
+    /* reference values of the long route, in the same scale */
+    int32_t ec = rd32(mem, ds + 0x22EC) * N;
+    ww(mem, ds + 0x22EC, (uint16_t)ec); ww(mem, ds + 0x22EE, (uint16_t)((uint32_t)ec >> 16));
+    int32_t f0 = rd32(mem, ds + 0x22F0);
+    int32_t f1 = (int32_t)lround(N * (f0 - cy) + cy);
+    ww(mem, ds + 0x22F0, (uint16_t)f1); ww(mem, ds + 0x22F2, (uint16_t)((uint32_t)f1 >> 16));
+
+    /* near call to 6667 that returns to where we are now */
+    c->r[SP] -= 2;
+    ww(mem, ss + c->r[SP], ip);
+    c->ip = 0x6667;
+    int n = 0;
+    while (n < 20000 && !(c->ip == ip && c->r[SP] == save.r[SP] && c->s[CS] == save.s[CS])) { cpu_step(c); n++; }
+    int32_t xn = rd32(mem, ds + 0x22DE), yn = rd32(mem, ds + 0x22E2);
+
+    memcpy(mem + ds + 0x2200, h->save_vars, sizeof h->save_vars);
+    memcpy(mem + sp0, h->save_stack, sizeof h->save_stack);
+    memcpy(mem + cs + 0x6667, h->save_code, 6);
+    memcpy(mem + cs + 0x669B, h->save_code + 6, 6);
+    *c = save;
+    if (n >= 20000) return;
+
+    double fx = (xn - cx) / N + cx, fy = (yn - cy) / N + cy;
+    /* safety net: a rare edge case of the long route differs by a pixel */
+    if (fabs(fx - x1) > 1.2) fx = x1;
+    if (fabs(fy - y1) > 1.6) fy = y1 + 0.5;
+    hash_put(h, x1, y1, (float)fx, (float)fy);
+}
+
+static HItem *new_item(HFrame *f, int type) {
+    if (f->ni >= MAX_ITEMS) return NULL;
+    HItem *it = &f->items[f->ni++];
+    memset(it, 0, sizeof *it);
+    it->type = (uint8_t)type;
+    return it;
+}
+
+void hires_breakpoint(Hires *h, Machine *m, CPU *c) {
+    HFrame *f = &h->fr[h->cur];
+    uint8_t *mem = m->mem;
+    uint32_t ds = (uint32_t)c->s[DS] << 4, ss = (uint32_t)c->s[SS] << 4;
+    uint16_t sp = c->r[SP];
+    h->ds = c->s[DS];
+    switch (c->ip) {
+    case 0x663F: case 0x8A8B: case 0x8C6B:
+        rerun_projection(h, m, c);
+        break;
+    case 0x7FB2: {
+        if (f->ne >= MAX_EDGES) break;
+        int32_t x1 = (int32_t)(rw(mem, ds + 0x2366) | (uint32_t)rw(mem, ds + 0x2364) << 16);
+        int32_t x2 = (int32_t)(rw(mem, ds + 0x236A) | (uint32_t)rw(mem, ds + 0x2368) << 16);
+        int32_t y1 = (int32_t)(rw(mem, ds + 0x23FF) | (uint32_t)rw(mem, ds + 0x23FD) << 16);
+        int32_t y2 = (int32_t)(rw(mem, ds + 0x236E) | (uint32_t)rw(mem, ds + 0x236C) << 16);
+        HVert a = lookup(h, x1, y1), b = lookup(h, x2, y2);
+        HEdge *e = &f->edges[f->ne++];
+        e->x1 = a.x; e->y1 = a.y; e->x2 = b.x; e->y2 = b.y;
+        e->ix1 = x1; e->iy1 = y1; e->ix2 = x2; e->iy2 = y2;
+        e->col = (uint8_t)rw(mem, ds + 0x23D9);
+        e->ord = rw(mem, ds + 0x252F);
+        break;
+    }
+    case 0x7621: {
+        if (f->ne > h->pass_start) {
+            HItem *it = new_item(f, IT_GROUND);
+            if (it) { it->first = (uint32_t)h->pass_start; it->n = (uint16_t)(f->ne - h->pass_start); }
+        }
+        h->pass_start = f->ne;
+        /* remember both buffers to see afterwards which pixels it drew */
+        int rows = (int16_t)rw(mem, ds + 0x2591);
+        h->snap_rows = rows > 0 && rows <= VIEW_MAX ? rows : 0;
+        for (int k = 0; k < 2 && h->snap_rows; k++)
+            if (h->bufseg[k]) memcpy(h->snap[k], mem + ((uint32_t)h->bufseg[k] << 4), 320u * h->snap_rows);
+        break;
+    }
+    case 0x769A: {
+        int best = -1, bestn = 0;
+        for (int k = 0; k < 2 && h->snap_rows; k++) {
+            if (!h->bufseg[k]) continue;
+            const uint8_t *b = mem + ((uint32_t)h->bufseg[k] << 4);
+            int nchg = 0;
+            for (int i = 0; i < 320 * h->snap_rows; i++) nchg += b[i] != h->snap[k][i];
+            if (nchg > bestn) { bestn = nchg; best = k; }
+        }
+        if (best >= 0) {
+            const uint8_t *b = mem + ((uint32_t)h->bufseg[best] << 4);
+            if (f->gseg != h->bufseg[best]) { memset(f->gmask, 0, sizeof f->gmask); f->gseg = h->bufseg[best]; }
+            for (int i = 0; i < 320 * h->snap_rows; i++) if (b[i] != h->snap[best][i]) f->gmask[i] = 1;
+        }
+        break;
+    }
+    case 0x7B42: {
+        h->pending_poly = -1;
+        uint16_t list = rw(mem, ss + (uint16_t)(sp + 4)), a2 = rw(mem, ss + (uint16_t)(sp + 8));
+        int n = a2 >> 4;
+        if ((a2 & 15) == 15 || n < 3 || n > 32 || f->nv + n > MAX_VERTS) break;
+        HItem *it = new_item(f, IT_POLY);
+        if (!it) break;
+        it->first = (uint32_t)f->nv; it->n = (uint16_t)n;
+        for (int i = 0; i < n; i++) {
+            uint32_t v = ds + (uint16_t)(list + 8 * i);
+            f->verts[f->nv++] = lookup(h, rd32(mem, v), rd32(mem, v + 4));
+        }
+        it->col = 0xFF; /* not drawn unless confirmed */
+        h->pending_poly = f->ni - 1;
+        break;
+    }
+    case 0x7BBF:
+        if (h->pending_poly >= 0 && h->pending_poly < f->ni) f->items[h->pending_poly].col = (uint8_t)rw(mem, ds + 0x23D9);
+        h->pending_poly = -1;
+        break;
+    case 0x8CEC: {
+        h->pending_line = -1;
+        uint16_t idx = rw(mem, ss + (uint16_t)(sp + 4));
+        if (f->nv + 2 > MAX_VERTS) break;
+        HItem *it = new_item(f, IT_LINE);
+        if (!it) break;
+        uint32_t v = ds + (uint16_t)(0x2445 + 8 * idx);
+        it->first = (uint32_t)f->nv; it->n = 2;
+        f->verts[f->nv++] = lookup(h, rd32(mem, v), rd32(mem, v + 4));
+        f->verts[f->nv++] = lookup(h, rd32(mem, v + 8), rd32(mem, v + 12));
+        it->col = 0xFF;
+        h->pending_line = f->ni - 1;
+        break;
+    }
+    case 0x8D26:
+        if (h->pending_line >= 0 && h->pending_line < f->ni) f->items[h->pending_line].col = (uint8_t)rw(mem, ds + 0x252B);
+        h->pending_line = -1;
+        break;
+    }
+}
+
+void hires_present(Hires *h, Machine *m, CPU *c) {
+    HFrame *f = &h->fr[h->cur];
+    uint32_t ss = (uint32_t)c->s[SS] << 4;
+    uint16_t seg = rw(m->mem, ss + (uint16_t)(c->r[SP] + 6));
+    uint32_t ds = (uint32_t)h->ds << 4;
+    if (seg != h->bufseg[0]) { h->bufseg[1] = h->bufseg[0]; h->bufseg[0] = seg; }
+    int vh = h->ds ? (int16_t)rw(m->mem, ds + 0x2591) : 0;
+    int bot = h->ds ? (int16_t)rw(m->mem, ds + 0x2593) : 0;
+    int vw = h->ds ? (int16_t)rw(m->mem, ds + 0x2583) : 0;
+    /* only the full-width view (the forward view from the cockpit); the
+     * side and rear views use a narrower buffer placed elsewhere on screen */
+    if (h->found > 0 && f->ni > 0 && vw == 320 && vh > 8 && vh <= VIEW_MAX && ((uint32_t)seg << 4) + 320u * vh < 0xA0000) {
+        memcpy(f->buf, m->mem + ((uint32_t)seg << 4), 320u * vh);
+        /* no record of the renderer's pixels: allow the ground everywhere */
+        if (f->gseg != seg) memset(f->gmask, 1, sizeof f->gmask);
+        f->vh = vh;
+        f->bot = bot + 1.5f;
+        f->time_us = m->time_us;
+        f->serial = ++h->serial;
+        h->ready = h->cur;
+        h->cur ^= 1;
+    }
+    f = &h->fr[h->cur];
+    f->ne = f->nv = f->ni = 0;
+    f->gseg = 0;
+    h->pass_start = 0;
+    h->pending_poly = h->pending_line = -1;
+    h->gen++;
+}
+
+void hires_debug(Hires *h, Machine *m, FILE *out) {
+    fprintf(out, "hires: found=%d cs=%04X ds=%04X ready=%d", h->found, h->cs, h->ds, h->ready);
+    if (h->ready >= 0) {
+        const HFrame *f = &h->fr[h->ready];
+        int same = 0;
+        for (int i = 0; i < 320 * f->vh; i++) same += m->mem[0xA0000 + i] == f->buf[i];
+        fprintf(out, " vh=%d bot=%.1f edges=%d items=%d age=%.0fms same=%.0f%%", f->vh, f->bot, f->ne, f->ni,
+                (m->time_us - f->time_us) / 1000, f->vh ? 100.0 * same / (320 * f->vh) : 0);
+    }
+    uint32_t ds = (uint32_t)h->ds << 4;
+    if (h->ds) fprintf(out, " [2591]=%d [2593]=%d [2583]=%d [2587]=%d [2595]=%d", (int16_t)rw(m->mem, ds + 0x2591), (int16_t)rw(m->mem, ds + 0x2593),
+                       (int16_t)rw(m->mem, ds + 0x2583), (int16_t)rw(m->mem, ds + 0x2587), (int16_t)rw(m->mem, ds + 0x2595));
+    fprintf(out, "\n");
+    if (getenv("HIRES_ITEMS") && h->ready >= 0) {
+        const HFrame *f = &h->fr[h->ready];
+        for (int i = 0; i < f->ni; i++) {
+            const HItem *it = &f->items[i];
+            fprintf(out, "  item %d type %d col %d n %d:", i, it->type, it->col, it->n);
+            if (it->type == IT_GROUND) { for (int k = 0; k < it->n; k++) { const HEdge *e = &f->edges[it->first + k]; fprintf(out, " [%.0f,%.0f-%.0f,%.0f o%d c%d]", e->x1, e->y1, e->x2, e->y2, e->ord, e->col); } }
+            else for (int k = 0; k < it->n; k++) fprintf(out, " (%.1f,%.1f)", f->verts[it->first + k].x, f->verts[it->first + k].y);
+            fprintf(out, "\n");
+        }
+    }
+}
+
+/* ------------------------------------------------------------- drawing */
+typedef struct {
+    uint8_t *dst; int w, h;       /* target (palette indices) */
+    int s;                        /* pixels per game pixel */
+    float bot;
+    const uint8_t *gmask;         /* where ground may be drawn (320 wide), or NULL */
+} Target;
+
+typedef void (*SpanFn)(const Target *t, int row, int x0, int x1, void *ctx);
+
+/* Even-odd fill of a set of edges (y pointing up, in game pixels). */
+static void fill_edges(const Target *t, const HEdge *e, int n, SpanFn fn, void *ctx) {
+    float ymin = 1e9f, ymax = -1e9f;
+    for (int i = 0; i < n; i++) {
+        ymin = fminf(ymin, fminf(e[i].y1, e[i].y2));
+        ymax = fmaxf(ymax, fmaxf(e[i].y1, e[i].y2));
+    }
+    int r0 = (int)floorf((t->bot - ymax) * t->s - 0.5f), r1 = (int)ceilf((t->bot - ymin) * t->s);
+    if (r0 < 0) r0 = 0;
+    if (r1 > t->h - 1) r1 = t->h - 1;
+    float xs[64];
+    for (int r = r0; r <= r1; r++) {
+        float y = t->bot - (r + 0.5f) / t->s;
+        int k = 0;
+        for (int i = 0; i < n && k < 64; i++) {
+            float y1 = e[i].y1, y2 = e[i].y2;
+            if ((y1 <= y && y < y2) || (y2 <= y && y < y1)) {
+                float x = e[i].x1 + (y - y1) * (e[i].x2 - e[i].x1) / (y2 - y1);
+                int j = k++;
+                while (j > 0 && xs[j - 1] > x) { xs[j] = xs[j - 1]; j--; }
+                xs[j] = x;
+            }
+        }
+        for (int i = 0; i + 1 < k; i += 2) {
+            float a = xs[i] * t->s - 0.5f, b = xs[i + 1] * t->s - 0.5f;
+            if (b < 0 || a >= t->w) continue;
+            int x0 = a < 0 ? 0 : (int)ceilf(a), x1 = b >= t->w ? t->w : (int)ceilf(b);
+            if (x1 > x0) fn(t, r, x0, x1, ctx);
+        }
+    }
+}
+
+static void fill_poly(const Target *t, const HVert *v, int n, SpanFn fn, void *ctx) {
+    HEdge e[34];
+    if (n > 32) n = 32;
+    for (int i = 0; i < n; i++) {
+        const HVert *a = &v[i], *b = &v[(i + 1) % n];
+        e[i] = (HEdge){a->x, a->y, b->x, b->y, 0, 0, 0, 0, 0, 0};
+    }
+    fill_edges(t, e, n, fn, ctx);
+}
+
+static void fill_line(const Target *t, HVert a, HVert b, float half, SpanFn fn, void *ctx) {
+    float dx = b.x - a.x, dy = b.y - a.y, len = sqrtf(dx * dx + dy * dy);
+    if (len < 1e-4f) { dx = 1; dy = 0; len = 1; }
+    /* one game pixel thick in the main direction, like the game's lines */
+    float px = -dy / len * half, py = dx / len * half;
+    float k = fmaxf(fabsf(dx), fabsf(dy)) / len;
+    px /= k; py /= k;
+    HVert q[4] = {{a.x + px, a.y + py}, {b.x + px, b.y + py}, {b.x - px, b.y - py}, {a.x - px, a.y - py}};
+    fill_poly(t, q, 4, fn, ctx);
+}
+
+typedef struct { uint8_t col, kind; const int8_t *shade; } PaintCtx;
+
+static void span_paint(const Target *t, int row, int x0, int x1, void *ctx) {
+    const PaintCtx *p = ctx;
+    uint8_t c = p->col;
+    if (p->shade) c = (uint8_t)(c + p->shade[row / t->s]);
+    uint8_t *d = t->dst + (size_t)row * t->w;
+    if (p->kind == 1 && t->gmask) {
+        const uint8_t *g = t->gmask + (row / t->s) * 320;
+        for (int x = x0; x < x1; x++) if (g[x / t->s]) d[x] = c;
+    } else memset(d + x0, c, (size_t)(x1 - x0));
+}
+
+typedef struct { int total, match; uint8_t col; } CountCtx;
+
+static void span_count(const Target *t, int row, int x0, int x1, void *ctx) {
+    CountCtx *p = ctx;
+    const uint8_t *d = t->dst + (size_t)row * t->w;
+    for (int x = x0; x < x1; x++) { p->total++; p->match += d[x] == p->col; }
+}
+
+typedef struct { Hires *h; uint8_t kind, col; } MarkCtx;
+
+static void span_mark(const Target *t, int row, int x0, int x1, void *ctx) {
+    const MarkCtx *p = ctx;
+    for (int x = x0; x < x1; x++) {
+        if (p->kind == 1 && t->gmask && !t->gmask[row * 320 + x]) continue;
+        p->h->kind1[row * 320 + x] = p->kind; p->h->base1[row * 320 + x] = p->col;
+    }
+}
+
+/* draws all items of a frame into a target */
+static void draw_items(Hires *h, const HFrame *f, const Target *t, int mark, const int8_t *shade) {
+    for (int i = 0; i < f->ni; i++) {
+        const HItem *it = &f->items[i];
+        if (it->type != IT_GROUND && (it->col == 0xFF || h->skip[i])) continue;
+        if (it->type == IT_GROUND) {
+            /* consecutive edges with the same polygon number form a polygon */
+            const HEdge *e = f->edges + it->first;
+            int n = it->n, s = 0;
+            while (s < n) {
+                int k = s + 1;
+                while (k < n && e[k].ord == e[s].ord) k++;
+                /* an edge that is there twice (a shared side of two parts of
+                 * one shape) cancels out in the game's even-odd fill; the
+                 * precise positions may differ a little, so drop both */
+                HEdge pe[64]; int np = 0;
+                uint8_t gone[64] = {0};
+                int cnt = k - s > 64 ? 64 : k - s;
+                for (int i = 0; i < cnt; i++) {
+                    if (gone[i]) continue;
+                    const HEdge *a = &e[s + i];
+                    for (int j = i + 1; j < cnt; j++) {
+                        const HEdge *b = &e[s + j];
+                        if (gone[j]) continue;
+                        if ((a->ix1 == b->ix1 && a->iy1 == b->iy1 && a->ix2 == b->ix2 && a->iy2 == b->iy2) ||
+                            (a->ix1 == b->ix2 && a->iy1 == b->iy2 && a->ix2 == b->ix1 && a->iy2 == b->iy1)) { gone[i] = gone[j] = 1; break; }
+                    }
+                    if (!gone[i]) pe[np++] = *a;
+                }
+                if (np >= 2) {
+                    if (mark) { MarkCtx mc = {h, 1, e[s].col}; fill_edges(t, pe, np, span_mark, &mc); }
+                    else { PaintCtx pc = {e[s].col, 1, shade}; fill_edges(t, pe, np, span_paint, &pc); }
+                }
+                s = k;
+            }
+        } else if (it->type == IT_LINE) {
+            const HVert *v = f->verts + it->first;
+            if (mark) { MarkCtx mc = {h, 2, it->col}; fill_line(t, v[0], v[1], 0.5f, span_mark, &mc); }
+            else { PaintCtx pc = {it->col, 2, NULL}; fill_line(t, v[0], v[1], 0.45f, span_paint, &pc); }
+        } else {
+            const HVert *v = f->verts + it->first;
+            if (mark) { MarkCtx mc = {h, 3, it->col}; fill_poly(t, v, it->n, span_mark, &mc); }
+            else { PaintCtx pc = {it->col, 3, NULL}; fill_poly(t, v, it->n, span_paint, &pc); }
+        }
+    }
+}
+
+int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
+    if (!h || h->found <= 0 || h->ready < 0 || n < 2 || n > 8) return 0;
+    if (m->vmode != 0x13 || m->planar) return 0;
+    const HFrame *f = &h->fr[h->ready];
+    if (m->time_us - f->time_us > 500000.0) return 0;
+    const int vh = f->vh, W = 320;
+    const uint8_t *src = f->buf, *vram = m->mem + 0xA0000;
+
+    /* the screen must still show this frame (not the map or a menu) */
+    int same = 0;
+    for (int i = 0; i < W * vh; i++) same += vram[i] == src[i];
+    if (same < W * vh / 4) return 0;
+
+    int HW = W * n, HH = vh * n;
+    if (h->hidx_serial == f->serial && h->hidx_n == n) goto screen;
+
+    /* 0. the line routine also gets lines it then leaves out (behind the
+     * camera, clipped away); keep only lines the game's picture shows */
+    for (int i = 0; i < f->ni; i++) {
+        const HItem *it = &f->items[i];
+        h->skip[i] = 0;
+        if (it->type != IT_LINE || it->col == 0xFF) continue;
+        Target tc = {(uint8_t *)src, W, vh, 1, f->bot, NULL};
+        CountCtx cc = {0, 0, it->col};
+        fill_line(&tc, f->verts[it->first], f->verts[it->first + 1], 0.5f, span_count, &cc);
+        if (cc.match * 10 < cc.total * 3) h->skip[i] = 1;
+    }
+
+    /* 1. coverage at the game's resolution */
+    Target t1 = {NULL, W, vh, 1, f->bot, f->gmask};
+    memset(h->kind1, 0, (size_t)W * vh);
+    draw_items(h, f, &t1, 1, NULL);
+
+    /* 2. depth shading of the ground per row: the game adds 0..7 to the base
+     * colour of a ground polygon depending on the distance */
+    int8_t shade[VIEW_MAX];
+    int have[VIEW_MAX];
+    for (int r = 0; r < vh; r++) {
+        int cnt[16] = {0}, best = -1;
+        for (int x = 0; x < W; x++) {
+            int i = r * W + x;
+            if (h->kind1[i] != 1) continue;
+            int d = src[i] - h->base1[i];
+            if (d >= 0 && d < 16) cnt[d]++;
+        }
+        for (int d = 0; d < 16; d++) if (cnt[d] && (best < 0 || cnt[d] > cnt[best])) best = d;
+        have[r] = best >= 0;
+        shade[r] = (int8_t)(best >= 0 ? best : 0);
+    }
+    for (int r = 0; r < vh; r++) if (!have[r]) {
+        for (int d = 1; d < vh; d++) {
+            if (r - d >= 0 && have[r - d]) { shade[r] = shade[r - d]; break; }
+            if (r + d < vh && have[r + d]) { shade[r] = shade[r + d]; break; }
+        }
+    }
+
+    /* 3. background: the game's picture with the redrawn shapes (and one
+     * pixel around them) filled from the nearest pixel of the same kind
+     * (ground or sky) in the same row; if the row has none, from the row
+     * below (ground) or above (sky) */
+    uint8_t *unres = h->exp1; /* scratch */
+    for (int r = 0; r < vh; r++) {
+        for (int x = 0; x < W; x++) {
+            int i = r * W + x, cov = 0;
+            for (int dy = -1; dy <= 1 && !cov; dy++)
+                for (int dx = -1; dx <= 1 && !cov; dx++) {
+                    int yy = r + dy, xx = x + dx;
+                    if (yy >= 0 && yy < vh && xx >= 0 && xx < W && h->kind1[yy * W + xx]) cov = 1;
+                }
+            h->other1[i] = (uint8_t)cov; /* temporarily: covered mask */
+        }
+        for (int x = 0; x < W; x++) {
+            int i = r * W + x;
+            unres[i] = 0;
+            if (!h->other1[i]) { h->bg1[i] = src[i]; continue; }
+            uint8_t cls = f->gmask[i];
+            int best = -1;
+            for (int d = 1; d < W && best < 0; d++) {
+                if (x - d >= 0 && !h->other1[i - d] && f->gmask[i - d] == cls) best = i - d;
+                else if (x + d < W && !h->other1[i + d] && f->gmask[i + d] == cls) best = i + d;
+            }
+            if (best >= 0) h->bg1[i] = src[best];
+            else unres[i] = 1;
+        }
+    }
+    for (int r = 0; r < vh; r++)
+        for (int x = 0; x < W; x++) {
+            int i = r * W + x;
+            if (unres[i] && !f->gmask[i]) { h->bg1[i] = r > 0 ? h->bg1[i - W] : src[i]; unres[i] = 0; }
+        }
+    for (int r = vh - 1; r >= 0; r--)
+        for (int x = 0; x < W; x++) {
+            int i = r * W + x;
+            if (unres[i]) h->bg1[i] = r < vh - 1 ? h->bg1[i + W] : src[i];
+        }
+
+    /* 4. what the redraw gives at the game's resolution; pixels that differ
+     * (and are not on the border of a shape) were drawn by something else:
+     * aircraft, smoke, explosions. Those are kept from the game's picture. */
+    for (int i = 0; i < W * vh; i++) {
+        int k = h->kind1[i];
+        h->exp1[i] = k == 0 ? h->bg1[i] : (uint8_t)(h->base1[i] + (k == 1 ? shade[i / W] : 0));
+    }
+    for (int r = 0; r < vh; r++)
+        for (int x = 0; x < W; x++) {
+            int i = r * W + x, e = h->exp1[i], edge = 0;
+            if (x > 0 && h->exp1[i - 1] != e) edge = 1;
+            if (x < W - 1 && h->exp1[i + 1] != e) edge = 1;
+            if (r > 0 && h->exp1[i - W] != e) edge = 1;
+            if (r < vh - 1 && h->exp1[i + W] != e) edge = 1;
+            int oth = src[i] != e && !edge;
+            /* a colour that the redraw has close by is a small difference in
+             * where an edge falls, not something else */
+            for (int dy = -2; dy <= 2 && oth; dy++)
+                for (int dx = -2; dx <= 2 && oth; dx++) {
+                    int yy = r + dy, xx = x + dx;
+                    if (yy >= 0 && yy < vh && xx >= 0 && xx < W && h->exp1[yy * W + xx] == src[i]) oth = 0;
+                }
+            h->other1[i] = (uint8_t)oth;
+        }
+
+    /* 5. redraw at n times the resolution */
+    size_t need = (size_t)HW * HH;
+    if (h->hidx_size < need) {
+        free(h->hidx);
+        h->hidx = malloc(need);
+        if (!h->hidx) { h->hidx_size = 0; h->hidx_serial = 0; return 0; }
+        h->hidx_size = need;
+    }
+    for (int r = 0; r < HH; r++) {
+        const uint8_t *b = h->bg1 + (r / n) * W;
+        uint8_t *d = h->hidx + (size_t)r * HW;
+        for (int x = 0; x < W; x++) memset(d + x * n, b[x], (size_t)n);
+    }
+    Target tn = {h->hidx, HW, HH, n, f->bot, f->gmask};
+    draw_items(h, f, &tn, 0, shade);
+    for (int r = 0; r < vh; r++)
+        for (int x = 0; x < W; x++)
+            if (h->other1[r * W + x])
+                for (int yy = 0; yy < n; yy++) memset(h->hidx + (size_t)(r * n + yy) * HW + x * n, src[r * W + x], (size_t)n);
+    h->hidx_serial = f->serial; h->hidx_n = n;
+
+screen:;
+    /* 6. the screen: the redrawn view where the screen shows the 3D view,
+     * the screen itself (cockpit) everywhere else */
+    const uint32_t *pal = m->palette_rgba;
+    uint8_t mask = m->dac_mask;
+    for (int y = 0; y < 200; y++) {
+        for (int x = 0; x < W; x++) {
+            uint8_t v = vram[y * W + x];
+            uint32_t *o = out + (size_t)y * n * HW + (size_t)x * n;
+            if (y < vh && v == src[y * W + x]) {
+                for (int yy = 0; yy < n; yy++) {
+                    const uint8_t *hi = h->hidx + (size_t)(y * n + yy) * HW + x * n;
+                    uint32_t *oo = o + (size_t)yy * HW;
+                    for (int xx = 0; xx < n; xx++) oo[xx] = pal[hi[xx] & mask];
+                }
+            } else {
+                uint32_t c = pal[v & mask];
+                for (int yy = 0; yy < n; yy++) {
+                    uint32_t *oo = o + (size_t)yy * HW;
+                    for (int xx = 0; xx < n; xx++) oo[xx] = c;
+                }
+            }
+        }
+    }
+    return 1;
+}
