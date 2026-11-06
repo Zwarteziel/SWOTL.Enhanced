@@ -1136,15 +1136,15 @@ int main(int argc, char **argv) {
         while (sf && dbg_n < 64 && fgets(ln, sizeof ln, sf)) {
             double t; char cmd[16]; unsigned k; float x, y;
             if (sscanf(ln, "%lf %15s", &t, cmd) != 2) continue;
-            if (!strcmp(cmd, "key") && sscanf(ln, "%*f %*s %x", &k) == 1) { dbg_ev[dbg_n].t = t; dbg_ev[dbg_n].key = (int)k; dbg_n++; }
+            if (!strcmp(cmd, "key") && sscanf(ln, "%*f %*s %x", &k) == 1) { dbg_ev[dbg_n].t = t; dbg_ev[dbg_n].key = (int)k | (strstr(ln, "ext") ? 0x100 : 0); dbg_n++; }
             else if (!strcmp(cmd, "joy") && sscanf(ln, "%*f %*s %f %f", &x, &y) == 2) { dbg_ev[dbg_n].t = t; dbg_ev[dbg_n].key = -1; dbg_ev[dbg_n].x = x; dbg_ev[dbg_n].y = y; dbg_n++; }
         }
         if (sf) fclose(sf);
     }
     while (running && !a->m->exited) {
-        if (dbg_up && a->m->time_us / 1000 >= dbg_up_t) { machine_key(a->m, dbg_up, 0, 0); dbg_up = 0; }
+        if (dbg_up && a->m->time_us / 1000 >= dbg_up_t) { machine_key(a->m, dbg_up & 0xFF, dbg_up >> 8, 0); dbg_up = 0; }
         if (dbg_i < dbg_n && !dbg_up && a->m->time_us / 1000 >= dbg_ev[dbg_i].t) {
-            if (dbg_ev[dbg_i].key >= 0) { machine_key(a->m, dbg_ev[dbg_i].key, 0, 1); dbg_up = dbg_ev[dbg_i].key; dbg_up_t = a->m->time_us / 1000 + 80; }
+            if (dbg_ev[dbg_i].key >= 0) { machine_key(a->m, dbg_ev[dbg_i].key & 0xFF, dbg_ev[dbg_i].key >> 8, 1); dbg_up = dbg_ev[dbg_i].key; dbg_up_t = a->m->time_us / 1000 + (dbg_ev[dbg_i].key >> 8 ? 600 : 80); }
             else machine_joystick(a->m, dbg_ev[dbg_i].x, dbg_ev[dbg_i].y, -2, -2, 0);
             dbg_i++;
         }

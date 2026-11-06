@@ -81,6 +81,7 @@ struct Hires {
     uint8_t skip[MAX_ITEMS];
     uint16_t bufseg[2];  /* the two 3D buffers the game alternates between */
     uint8_t wmap[320 * VIEW_MAX]; /* CPU write tracking map */
+    uint8_t vprev[320 * VIEW_MAX];   /* screen mask of the previous ready frame */
     uint16_t wseg; int wrows;
     /* the line or polygon being drawn: its region of the buffer before */
     int line_item, lx0, lx1, ly0, ly1; uint16_t lseg; int lrows;
@@ -449,6 +450,8 @@ void hires_present(Hires *h, Machine *m, CPU *c) {
     if (h->pend >= 0) {
         HFrame *p = &h->fr[h->pend];
         const uint8_t *vram = m->mem + 0xA0000;
+        if (h->ready >= 0) memcpy(h->vprev, h->fr[h->ready].vmask, sizeof h->vprev);
+        else memset(h->vprev, 0, sizeof h->vprev);
         for (int i = 0; i < 320 * p->vh; i++) p->vmask[i] = vram[i] == p->buf[i];
         if (dbg_on()) {
             int a1 = 0, a2 = 0, a3 = 0;
@@ -461,6 +464,7 @@ void hires_present(Hires *h, Machine *m, CPU *c) {
     }
     /* only the full-width view (the forward view from the cockpit); the
      * side and rear views use a narrower buffer placed elsewhere on screen */
+    if (dbg_on()) fprintf(stderr, "[hires] present %04X ni=%d vw=%d vh=%d t=%.0f\n", seg, f->ni, vw, vh, m->time_us / 1000);
     if (h->found > 0 && f->ni > 0 && vw == 320 && vh > 8 && vh <= VIEW_MAX && ((uint32_t)seg << 4) + 320u * vh < 0xA0000) {
         memcpy(f->buf, m->mem + ((uint32_t)seg << 4), 320u * vh);
         /* no record of the renderer's pixels: allow the ground everywhere */
@@ -807,14 +811,19 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
 
 screen:;
     /* 6. the screen: the redrawn view where the screen shows the 3D view,
-     * the screen itself (cockpit) everywhere else */
+     * the screen itself (cockpit) everywhere else. A pixel shows the 3D view
+     * when it is part of the view (in this or the previous frame) and the
+     * screen holds this frame or the next one there; anything the game draws
+     * straight onto the screen (flak, the gunsight) is shown as it is, and
+     * where it has gone again the redrawn view shows. */
     const uint32_t *pal = m->palette_rgba;
     uint8_t mask = m->dac_mask;
     for (int y = 0; y < 200; y++) {
         for (int x = 0; x < W; x++) {
             uint8_t v = vram[y * W + x];
             uint32_t *o = out + (size_t)y * n * HW + (size_t)x * n;
-            if (y < vh && f->vmask[y * W + x]) {
+            int i3 = y * W + x;
+            if (y < vh && (f->vmask[i3] || h->vprev[i3]) && (v == src[i3] || v == nxt[i3])) {
                 for (int yy = 0; yy < n; yy++) {
                     const uint8_t *hi = h->hidx + (size_t)(y * n + yy) * HW + x * n;
                     uint32_t *oo = o + (size_t)yy * HW;

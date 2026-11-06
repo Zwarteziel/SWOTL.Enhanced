@@ -1,6 +1,6 @@
 # SWOTL Enhanced
 
-Version 0.1.16
+Version 0.1.17
 
 Run **Secret Weapons of the Luftwaffe** (Lucasfilm Games, 1991) on modern Windows
 without installing DOSBox. You need your own copy of the original game files.
