@@ -43,12 +43,19 @@ static inline uint16_t rw(CPU *c, uint16_t s, uint16_t o) {
 }
 static inline void wb(CPU *c, uint16_t s, uint16_t o, uint8_t v) {
     uint32_t a = cpu_lin(c, s, o);
+    uint32_t d = a - c->wt_lo;
+    if (d < c->wt_len) c->wt_map[d] = 1;
     if (a < 0xA0000) { c->mem[a] = v; return; }
     mem_wb(c, a, v);
 }
 static inline void ww(CPU *c, uint16_t s, uint16_t o, uint16_t v) {
     uint32_t a = cpu_lin(c, s, o);
-    if (a < 0x9FFFF && o != 0xFFFF) { c->mem[a] = (uint8_t)v; c->mem[a + 1] = (uint8_t)(v >> 8); return; }
+    if (a < 0x9FFFF && o != 0xFFFF) {
+        uint32_t d = a - c->wt_lo;
+        if (d < c->wt_len) c->wt_map[d] = 1;
+        if (d + 1 < c->wt_len) c->wt_map[d + 1] = 1;
+        c->mem[a] = (uint8_t)v; c->mem[a + 1] = (uint8_t)(v >> 8); return;
+    }
     wb(c, s, o, (uint8_t)v);
     wb(c, s, (uint16_t)(o + 1), (uint8_t)(v >> 8));
 }

@@ -33,7 +33,7 @@
 enum { IT_GROUND, IT_LINE, IT_POLY };
 
 typedef struct { float x1, y1, x2, y2; int32_t ix1, iy1, ix2, iy2; uint16_t ord; uint8_t col; } HEdge;
-typedef struct { uint8_t type, col; uint16_t n; uint32_t first; } HItem;
+typedef struct { uint8_t type, col; uint16_t n; uint32_t first; float t0, t1; } HItem;
 typedef struct { float x, y; } HVert;
 
 typedef struct {
@@ -47,8 +47,14 @@ typedef struct {
     uint64_t serial;
     /* pixels written by the scanline renderer (the visible ground), at the
      * game's resolution, for buffer segment gseg */
-    uint8_t gmask[320 * VIEW_MAX];
+    uint8_t gmask[320 * VIEW_MAX], gval[320 * VIEW_MAX];
     uint16_t gseg;
+    int gok;             /* gmask/gval belong to this frame's buffer */
+    /* pixels written by the line and polygon routines, and the colour */
+    uint8_t lmask[320 * VIEW_MAX], lval[320 * VIEW_MAX];
+    /* pixels of the 3D view the screen shows (not covered by the cockpit),
+     * taken once the game has copied the whole frame to the screen */
+    uint8_t vmask[320 * VIEW_MAX];
 } HFrame;
 
 typedef struct { int32_t x, y; float fx, fy; uint32_t gen; } HSlot;
@@ -58,9 +64,10 @@ struct Hires {
     uint16_t cs;
     uint16_t ds;
     uint8_t bpmap[8192];
-    HFrame fr[2];
+    HFrame fr[3];
     int cur;             /* frame being captured */
-    int ready;           /* index of the last complete frame, -1 = none */
+    int pend;            /* captured, being copied to the screen, -1 = none */
+    int ready;           /* last frame fully on the screen, -1 = none */
     int pass_start;      /* first edge of the current ground pass */
     int pending_poly;    /* item index of a polygon waiting for 7BBF */
     int pending_line;    /* item index of a line waiting for its colour */
@@ -73,10 +80,14 @@ struct Hires {
     uint64_t hidx_serial; int hidx_n;
     uint8_t skip[MAX_ITEMS];
     uint16_t bufseg[2];  /* the two 3D buffers the game alternates between */
-    uint8_t snap[2][320 * VIEW_MAX];
-    int snap_rows;
+    uint8_t wmap[320 * VIEW_MAX]; /* CPU write tracking map */
+    uint16_t wseg; int wrows;
+    /* the line or polygon being drawn: its region of the buffer before */
+    int line_item, lx0, lx1, ly0, ly1; uint16_t lseg; int lrows;
     uint8_t kind1[320 * VIEW_MAX], base1[320 * VIEW_MAX], exp1[320 * VIEW_MAX], bg1[320 * VIEW_MAX], other1[320 * VIEW_MAX];
 };
+
+static int dbg_on(void);
 
 static const struct { uint16_t off; uint8_t len; uint8_t b[12]; } sigs[] = {
     {0x6667, 10, {0xC7, 0x06, 0xD8, 0x22, 0xB4, 0x00, 0xA1, 0xBA, 0x22, 0xE8}},
@@ -91,13 +102,18 @@ static const struct { uint16_t off; uint8_t len; uint8_t b[12]; } sigs[] = {
     {0x8CEC, 12, {0x55, 0x8B, 0xEC, 0x57, 0x56, 0x8B, 0x5E, 0x08, 0xF7, 0x06, 0x81, 0x25}},
     {0x8D26, 3, {0xBE, 0x45, 0x24}},
     {0x7693, 8, {0x07, 0x5E, 0x5F, 0xA1, 0xFF, 0x23, 0x5D, 0xCB}},
+    {0x911F, 4, {0x5E, 0x5F, 0x5D, 0xCB}},
+    {0x7EB2, 4, {0x5E, 0x5F, 0x5D, 0xCB}},
+    {0x7B62, 4, {0x8E, 0x06, 0x79, 0x25}},
+    {0x8D38, 4, {0x8E, 0x06, 0x79, 0x25}},
 };
-static const uint16_t bps[] = {0x663F, 0x8A8B, 0x8C6B, 0x7FB2, 0x7621, 0x7B42, 0x7BBF, 0x8CEC, 0x8D26, 0x769A};
+static const uint16_t bps[] = {0x663F, 0x8A8B, 0x8C6B, 0x7FB2, 0x7621, 0x7B42, 0x7BBF, 0x8CEC, 0x8D26, 0x769A, 0x9122, 0x7EB5};
 
 Hires *hires_create(void) {
     Hires *h = calloc(1, sizeof *h);
     if (!h) return NULL;
-    h->ready = -1;
+    h->ready = h->pend = -1;
+    h->line_item = -1;
     h->gen = 1;
     h->pending_poly = h->pending_line = -1;
     for (size_t i = 0; i < sizeof bps / sizeof bps[0]; i++) h->bpmap[bps[i] >> 3] |= (uint8_t)(1 << (bps[i] & 7));
@@ -150,6 +166,7 @@ int hires_scan(Hires *h, Machine *m, int in_3d) {
 void hires_detach(Hires *h, Machine *m) {
     (void)h;
     m->cpu.bp_cs = 0;
+    m->cpu.wt_len = 0;
 }
 
 /* ------------------------------------------------------------- capture */
@@ -245,6 +262,74 @@ static HItem *new_item(HFrame *f, int type) {
     return it;
 }
 
+/* Lines and object polygons: the game clips them, leaves out lines behind
+ * the camera and polygons facing away. To know what it really drew, the CPU
+ * marks every write to the rows the item can touch until the routine ends. */
+static void region_start(Hires *h, Machine *m, uint32_t ds, HFrame *f, int item) {
+    const uint8_t *mem = m->mem;
+    h->line_item = -1;
+    uint16_t bseg = rw(mem, ds + 0x2579);
+    int rows = (int16_t)rw(mem, ds + 0x2591);
+    float bot = (int16_t)rw(mem, ds + 0x2593) + 1.5f;
+    if (rows <= 0 || rows > VIEW_MAX || !bseg || ((uint32_t)bseg << 4) + 320u * rows > 0xA0000) return;
+    const HItem *it = &f->items[item];
+    float fx0 = 1e9f, fx1 = -1e9f, fy0 = 1e9f, fy1 = -1e9f;
+    for (int i = 0; i < it->n; i++) {
+        const HVert *v = &f->verts[it->first + i];
+        fx0 = fminf(fx0, v->x); fx1 = fmaxf(fx1, v->x);
+        fy0 = fminf(fy0, bot - v->y); fy1 = fmaxf(fy1, bot - v->y);
+    }
+    int x0 = fx0 < 1 ? 0 : (int)fx0 - 1, x1 = fx1 > 318 ? 319 : (int)fx1 + 1;
+    int y0 = fy0 < 1 ? 0 : (int)fy0 - 1, y1 = fy1 > rows - 2 ? rows - 1 : (int)fy1 + 1;
+    h->line_item = item; h->lseg = bseg; h->lrows = rows;
+    h->lx0 = x0; h->lx1 = x1; h->ly0 = y0; h->ly1 = y1;
+    if (x0 > x1 || y0 > y1) return;
+    /* let the CPU mark every byte written in these rows */
+    uint32_t len = 320u * (uint32_t)(y1 - y0 + 1);
+    memset(h->wmap, 0, len);
+    m->cpu.wt_map = h->wmap;
+    m->cpu.wt_lo = ((uint32_t)bseg << 4) + 320u * (uint32_t)y0;
+    m->cpu.wt_len = len;
+}
+
+static void region_end(Hires *h, Machine *m, uint32_t ds, HFrame *f) {
+    int li = h->line_item;
+    h->line_item = -1;
+    int tracked = m->cpu.wt_len != 0;
+    m->cpu.wt_len = 0;
+    if (li < 0 || li >= f->ni) return;
+    HItem *it = &f->items[li];
+    int cnt = 0;
+    float t0 = 1e9f, t1 = -1e9f;
+    const HVert *a = &f->verts[it->first], *b = a + 1;
+    float bot = (int16_t)rw(m->mem, ds + 0x2593) + 1.5f;
+    float dx = b->x - a->x, dy = b->y - a->y, l2 = dx * dx + dy * dy;
+    if (l2 < 1e-6f) l2 = 1e-6f;
+    if (tracked && h->lx0 <= h->lx1 && h->ly0 <= h->ly1) {
+        const uint8_t *buf = m->mem + ((uint32_t)h->lseg << 4);
+        for (int y = h->ly0; y <= h->ly1; y++)
+            for (int x = h->lx0; x <= h->lx1; x++) {
+                int i = y * 320 + x;
+                if (!h->wmap[(y - h->ly0) * 320 + x]) continue;
+                cnt++;
+                f->lmask[i] = 1;
+                f->lval[i] = buf[i];
+                if (it->type == IT_LINE) {
+                    float px = x + 0.5f, py = bot - (y + 0.5f);
+                    float t = ((px - a->x) * dx + (py - a->y) * dy) / l2;
+                    if (t < t0) t0 = t;
+                    if (t > t1) t1 = t;
+                }
+            }
+    }
+    if (!cnt) it->col = 0xFF; /* not drawn at all */
+    else if (it->type == IT_LINE) {
+        /* the drawn part, half a pixel longer at both ends */
+        float ext = 0.5f / sqrtf(l2);
+        it->t0 = fmaxf(0.f, t0 - ext); it->t1 = fminf(1.f, t1 + ext);
+    }
+}
+
 void hires_breakpoint(Hires *h, Machine *m, CPU *c) {
     HFrame *f = &h->fr[h->cur];
     uint8_t *mem = m->mem;
@@ -272,34 +357,36 @@ void hires_breakpoint(Hires *h, Machine *m, CPU *c) {
     case 0x7621: {
         if (f->ne > h->pass_start) {
             HItem *it = new_item(f, IT_GROUND);
-            if (it) { it->first = (uint32_t)h->pass_start; it->n = (uint16_t)(f->ne - h->pass_start); }
+            /* col = 1: in a steep bank the game renders the ground turned
+             * by 90 degrees ([233E]); that mapping is not known yet, so the
+             * ground then stays as the game drew it */
+            if (it) { it->first = (uint32_t)h->pass_start; it->n = (uint16_t)(f->ne - h->pass_start); it->col = rw(mem, ds + 0x233E) != 0; }
+            if (dbg_on()) fprintf(stderr, "[hires] 7621: [2338]=%d [2593]=%d [2591]=%d [2312]=%d [2314]=%d [2595]=%d [233A]=%d [233C]=%d\n", (int16_t)rw(mem, ds + 0x2338), (int16_t)rw(mem, ds + 0x2593), (int16_t)rw(mem, ds + 0x2591), (int16_t)rw(mem, ds + 0x2312), (int16_t)rw(mem, ds + 0x2314), (int16_t)rw(mem, ds + 0x2595), (int16_t)rw(mem, ds + 0x233A), (int16_t)rw(mem, ds + 0x233C));
         }
         h->pass_start = f->ne;
-        /* remember both buffers to see afterwards which pixels it drew */
+        /* let the CPU mark the pixels the renderer writes */
         int rows = (int16_t)rw(mem, ds + 0x2591);
-        h->snap_rows = rows > 0 && rows <= VIEW_MAX ? rows : 0;
-        for (int k = 0; k < 2 && h->snap_rows; k++)
-            if (h->bufseg[k]) memcpy(h->snap[k], mem + ((uint32_t)h->bufseg[k] << 4), 320u * h->snap_rows);
+        uint16_t bseg = rw(mem, ds + 0x2579);
+        h->wrows = 0;
+        if (rows > 0 && rows <= VIEW_MAX && bseg && ((uint32_t)bseg << 4) + 320u * rows <= 0xA0000) {
+            memset(h->wmap, 0, 320u * rows);
+            c->wt_map = h->wmap; c->wt_lo = (uint32_t)bseg << 4; c->wt_len = 320u * rows;
+            h->wseg = bseg; h->wrows = rows;
+        }
         break;
     }
     case 0x769A: {
-        int best = -1, bestn = 0;
-        for (int k = 0; k < 2 && h->snap_rows; k++) {
-            if (!h->bufseg[k]) continue;
-            const uint8_t *b = mem + ((uint32_t)h->bufseg[k] << 4);
-            int nchg = 0;
-            for (int i = 0; i < 320 * h->snap_rows; i++) nchg += b[i] != h->snap[k][i];
-            if (nchg > bestn) { bestn = nchg; best = k; }
-        }
-        if (best >= 0) {
-            const uint8_t *b = mem + ((uint32_t)h->bufseg[best] << 4);
-            if (f->gseg != h->bufseg[best]) { memset(f->gmask, 0, sizeof f->gmask); f->gseg = h->bufseg[best]; }
-            for (int i = 0; i < 320 * h->snap_rows; i++) if (b[i] != h->snap[best][i]) f->gmask[i] = 1;
-        }
+        int rows = c->wt_len ? h->wrows : 0;
+        c->wt_len = 0;
+        if (!rows) break;
+        const uint8_t *b = mem + ((uint32_t)h->wseg << 4);
+        if (f->gseg != h->wseg) { memset(f->gmask, 0, sizeof f->gmask); f->gseg = h->wseg; }
+        for (int i = 0; i < 320 * rows; i++) if (h->wmap[i]) { f->gmask[i] = 1; f->gval[i] = b[i]; }
         break;
     }
     case 0x7B42: {
         h->pending_poly = -1;
+        h->line_item = -1;
         uint16_t list = rw(mem, ss + (uint16_t)(sp + 4)), a2 = rw(mem, ss + (uint16_t)(sp + 8));
         int n = a2 >> 4;
         if ((a2 & 15) == 15 || n < 3 || n > 32 || f->nv + n > MAX_VERTS) break;
@@ -312,6 +399,7 @@ void hires_breakpoint(Hires *h, Machine *m, CPU *c) {
         }
         it->col = 0xFF; /* not drawn unless confirmed */
         h->pending_poly = f->ni - 1;
+        region_start(h, m, ds, f, f->ni - 1);
         break;
     }
     case 0x7BBF:
@@ -329,9 +417,15 @@ void hires_breakpoint(Hires *h, Machine *m, CPU *c) {
         f->verts[f->nv++] = lookup(h, rd32(mem, v), rd32(mem, v + 4));
         f->verts[f->nv++] = lookup(h, rd32(mem, v + 8), rd32(mem, v + 12));
         it->col = 0xFF;
+        it->t0 = 0; it->t1 = 1;
         h->pending_line = f->ni - 1;
+        region_start(h, m, ds, f, f->ni - 1);
         break;
     }
+    case 0x9122: case 0x7EB5:
+        /* end of the line or polygon routine: which pixels did it draw? */
+        region_end(h, m, ds, f);
+        break;
     case 0x8D26:
         if (h->pending_line >= 0 && h->pending_line < f->ni) f->items[h->pending_line].col = (uint8_t)rw(mem, ds + 0x252B);
         h->pending_line = -1;
@@ -348,22 +442,41 @@ void hires_present(Hires *h, Machine *m, CPU *c) {
     int vh = h->ds ? (int16_t)rw(m->mem, ds + 0x2591) : 0;
     int bot = h->ds ? (int16_t)rw(m->mem, ds + 0x2593) : 0;
     int vw = h->ds ? (int16_t)rw(m->mem, ds + 0x2583) : 0;
+    /* The game copies a frame to the screen during its present call, so at
+     * the next present the previous frame is completely on the screen: only
+     * then it is used, with the mask of where the screen shows it. Using a
+     * frame while it is still being copied mixes old and new pixels. */
+    if (h->pend >= 0) {
+        HFrame *p = &h->fr[h->pend];
+        const uint8_t *vram = m->mem + 0xA0000;
+        for (int i = 0; i < 320 * p->vh; i++) p->vmask[i] = vram[i] == p->buf[i];
+        if (dbg_on()) {
+            int a1 = 0, a2 = 0, a3 = 0;
+            const uint8_t *cur = m->mem + ((uint32_t)seg << 4);
+            for (int i = 0; i < 320 * p->vh; i++) { a1 += p->vmask[i]; a2 += vram[i] == cur[i]; a3 += p->buf[i] == cur[i]; }
+            fprintf(stderr, "[hires] present %04X: screen=pending %d screen=new %d pending=new %d\n", seg, a1, a2, a3);
+        }
+        h->ready = h->pend;
+        h->pend = -1;
+    }
     /* only the full-width view (the forward view from the cockpit); the
      * side and rear views use a narrower buffer placed elsewhere on screen */
     if (h->found > 0 && f->ni > 0 && vw == 320 && vh > 8 && vh <= VIEW_MAX && ((uint32_t)seg << 4) + 320u * vh < 0xA0000) {
         memcpy(f->buf, m->mem + ((uint32_t)seg << 4), 320u * vh);
         /* no record of the renderer's pixels: allow the ground everywhere */
-        if (f->gseg != seg) memset(f->gmask, 1, sizeof f->gmask);
+        f->gok = f->gseg == seg;
+        if (!f->gok) memset(f->gmask, 1, sizeof f->gmask);
         f->vh = vh;
         f->bot = bot + 1.5f;
         f->time_us = m->time_us;
         f->serial = ++h->serial;
-        h->ready = h->cur;
-        h->cur ^= 1;
+        h->pend = h->cur;
+        for (int k = 0; k < 3; k++) if (k != h->pend && k != h->ready) { h->cur = k; break; }
     }
     f = &h->fr[h->cur];
     f->ne = f->nv = f->ni = 0;
     f->gseg = 0;
+    memset(f->lmask, 0, sizeof f->lmask);
     h->pass_start = 0;
     h->pending_poly = h->pending_line = -1;
     h->gen++;
@@ -470,14 +583,6 @@ static void span_paint(const Target *t, int row, int x0, int x1, void *ctx) {
     } else memset(d + x0, c, (size_t)(x1 - x0));
 }
 
-typedef struct { int total, match; uint8_t col; } CountCtx;
-
-static void span_count(const Target *t, int row, int x0, int x1, void *ctx) {
-    CountCtx *p = ctx;
-    const uint8_t *d = t->dst + (size_t)row * t->w;
-    for (int x = x0; x < x1; x++) { p->total++; p->match += d[x] == p->col; }
-}
-
 typedef struct { Hires *h; uint8_t kind, col; } MarkCtx;
 
 static void span_mark(const Target *t, int row, int x0, int x1, void *ctx) {
@@ -494,6 +599,7 @@ static void draw_items(Hires *h, const HFrame *f, const Target *t, int mark, con
         const HItem *it = &f->items[i];
         if (it->type != IT_GROUND && (it->col == 0xFF || h->skip[i])) continue;
         if (it->type == IT_GROUND) {
+            if (it->col) continue;
             /* consecutive edges with the same polygon number form a polygon */
             const HEdge *e = f->edges + it->first;
             int n = it->n, s = 0;
@@ -524,9 +630,12 @@ static void draw_items(Hires *h, const HFrame *f, const Target *t, int mark, con
                 s = k;
             }
         } else if (it->type == IT_LINE) {
+            /* only the part the game drew (see 9122) */
             const HVert *v = f->verts + it->first;
-            if (mark) { MarkCtx mc = {h, 2, it->col}; fill_line(t, v[0], v[1], 0.5f, span_mark, &mc); }
-            else { PaintCtx pc = {it->col, 2, NULL}; fill_line(t, v[0], v[1], 0.45f, span_paint, &pc); }
+            HVert a = {v[0].x + it->t0 * (v[1].x - v[0].x), v[0].y + it->t0 * (v[1].y - v[0].y)};
+            HVert b = {v[0].x + it->t1 * (v[1].x - v[0].x), v[0].y + it->t1 * (v[1].y - v[0].y)};
+            if (mark) { MarkCtx mc = {h, 2, it->col}; fill_line(t, a, b, 0.5f, span_mark, &mc); }
+            else { PaintCtx pc = {it->col, 2, NULL}; fill_line(t, a, b, 0.45f, span_paint, &pc); }
         } else {
             const HVert *v = f->verts + it->first;
             if (mark) { MarkCtx mc = {h, 3, it->col}; fill_poly(t, v, it->n, span_mark, &mc); }
@@ -535,33 +644,39 @@ static void draw_items(Hires *h, const HFrame *f, const Target *t, int mark, con
     }
 }
 
+static int dbg_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("SWOTL_DEBUG_HIRES") != NULL;
+    return on;
+}
+
+static int dbg_why(const char *why, double a, double b) {
+    if (dbg_on()) fprintf(stderr, "[hires] no: %s %.0f %.0f\n", why, a, b);
+    return 0;
+}
+
 int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
     if (!h || h->found <= 0 || h->ready < 0 || n < 2 || n > 8) return 0;
-    if (m->vmode != 0x13 || m->planar) return 0;
+    if (m->vmode != 0x13 || m->planar) return dbg_why("mode", m->vmode, m->planar);
     const HFrame *f = &h->fr[h->ready];
-    if (m->time_us - f->time_us > 500000.0) return 0;
+    if (m->time_us - f->time_us > 500000.0) return dbg_why("age", m->time_us - f->time_us, 0);
     const int vh = f->vh, W = 320;
     const uint8_t *src = f->buf, *vram = m->mem + 0xA0000;
 
-    /* the screen must still show this frame (not the map or a menu) */
-    int same = 0;
-    for (int i = 0; i < W * vh; i++) same += vram[i] == src[i];
-    if (same < W * vh / 4) return 0;
+    /* the 3D view must take a fair part of the screen, and the screen must
+     * still show this frame or the one being copied (not the map or a menu) */
+    const uint8_t *nxt = h->pend >= 0 ? h->fr[h->pend].buf : src;
+    int same = 0, live = 0;
+    for (int i = 0; i < W * vh; i++)
+        if (f->vmask[i]) { same++; live += vram[i] == src[i] || vram[i] == nxt[i]; }
+    if (same < W * vh / 4) return dbg_why("same", same, W * vh);
+    if (live < same / 2) return dbg_why("live", live, same);
+    if (dbg_on()) fprintf(stderr, "[hires] ok serial %llu same %d\n", (unsigned long long)f->serial, same);
 
     int HW = W * n, HH = vh * n;
     if (h->hidx_serial == f->serial && h->hidx_n == n) goto screen;
 
-    /* 0. the line routine also gets lines it then leaves out (behind the
-     * camera, clipped away); keep only lines the game's picture shows */
-    for (int i = 0; i < f->ni; i++) {
-        const HItem *it = &f->items[i];
-        h->skip[i] = 0;
-        if (it->type != IT_LINE || it->col == 0xFF) continue;
-        Target tc = {(uint8_t *)src, W, vh, 1, f->bot, NULL};
-        CountCtx cc = {0, 0, it->col};
-        fill_line(&tc, f->verts[it->first], f->verts[it->first + 1], 0.5f, span_count, &cc);
-        if (cc.match * 10 < cc.total * 3) h->skip[i] = 1;
-    }
+    memset(h->skip, 0, sizeof h->skip);
 
     /* 1. coverage at the game's resolution */
     Target t1 = {NULL, W, vh, 1, f->bot, f->gmask};
@@ -653,6 +768,9 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
                     int yy = r + dy, xx = x + dx;
                     if (yy >= 0 && yy < vh && xx >= 0 && xx < W && h->exp1[yy * W + xx] == src[i]) oth = 0;
                 }
+            /* still showing what the ground, line or polygon routine drew */
+            if (f->lmask[i] && src[i] == f->lval[i]) oth = 0;
+            if (f->gok && f->gmask[i] && src[i] == f->gval[i]) oth = 0;
             h->other1[i] = (uint8_t)oth;
         }
 
@@ -676,6 +794,16 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
             if (h->other1[r * W + x])
                 for (int yy = 0; yy < n; yy++) memset(h->hidx + (size_t)(r * n + yy) * HW + x * n, src[r * W + x], (size_t)n);
     h->hidx_serial = f->serial; h->hidx_n = n;
+    if (dbg_on()) {
+        int no = 0, ns = 0, nl = 0, np = 0, nu = 0;
+        for (int i = 0; i < W * vh; i++) no += h->other1[i];
+        for (int i = 0; i < f->ni; i++) {
+            if (f->items[i].type == IT_LINE) { nl++; ns += h->skip[i]; }
+            if (f->items[i].type == IT_POLY) { np++; nu += f->items[i].col == 0xFF; }
+        }
+        fprintf(stderr, "[hires] frame %llu items %d edges %d lines %d skipped %d polys %d unconfirmed %d other %d gseg %04X\n",
+                (unsigned long long)f->serial, f->ni, f->ne, nl, ns, np, nu, no, f->gseg);
+    }
 
 screen:;
     /* 6. the screen: the redrawn view where the screen shows the 3D view,
@@ -686,7 +814,7 @@ screen:;
         for (int x = 0; x < W; x++) {
             uint8_t v = vram[y * W + x];
             uint32_t *o = out + (size_t)y * n * HW + (size_t)x * n;
-            if (y < vh && v == src[y * W + x]) {
+            if (y < vh && f->vmask[y * W + x]) {
                 for (int yy = 0; yy < n; yy++) {
                     const uint8_t *hi = h->hidx + (size_t)(y * n + yy) * HW + x * n;
                     uint32_t *oo = o + (size_t)yy * HW;

@@ -56,6 +56,10 @@ struct CPU {
     uint16_t bp_cs;
     const uint8_t *bp_map;
     void (*bp_hook)(void *host, CPU *c);
+    /* write tracking: a write to linear address wt_lo + i (i < wt_len) sets
+     * wt_map[i] = 1. wt_len = 0: off. */
+    uint32_t wt_lo, wt_len;
+    uint8_t *wt_map;
 };
 
 void cpu_reset(CPU *c);

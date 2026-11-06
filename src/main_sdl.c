@@ -561,8 +561,28 @@ static void present(App *a) {
     int w, h;
     if (!machine_render(a->m, a->frame, &w, &h)) return;
     const uint32_t *img = a->frame;
-    if (a->cfg.hires && a->hframe && machine_render_hires(a->m, a->cfg.hires, a->hframe)) {
-        img = a->hframe; w = 320 * a->cfg.hires; h = 200 * a->cfg.hires;
+    if (a->cfg.hires && a->hframe) {
+        /* keep the last high-resolution picture over a short gap (a frame
+         * that could not be redrawn), so the picture does not jump between
+         * resolutions */
+        static Uint64 last_ok;
+        Uint64 now = SDL_GetTicks();
+        if (machine_render_hires(a->m, a->cfg.hires, a->hframe)) last_ok = now;
+        if (last_ok && now - last_ok < 250) { img = a->hframe; w = 320 * a->cfg.hires; h = 200 * a->cfg.hires; }
+    }
+    {   /* test hook: save the presented pictures, "<emulated s>,<count>" */
+        static const char *seq; static int seq_n = -1;
+        if (seq_n < 0) { seq = getenv("SWOTL_DEBUG_SEQ"); seq_n = seq ? atoi(strchr(seq, ',') ? strchr(seq, ',') + 1 : "0") : 0; }
+        static int seq_i;
+        if (seq && seq_i < seq_n && a->m->time_us >= atof(seq) * 1e6) {
+            char fn[1300]; snprintf(fn, sizeof fn, "%sseq%03d.ppm", a->base, seq_i++);
+            FILE *f = fopen(fn, "wb");
+            if (f) {
+                fprintf(f, "P6 %d %d 255\n", w, h);
+                for (int i = 0; i < w * h; i++) { uint32_t p = img[i]; fputc(p & 255, f); fputc((p >> 8) & 255, f); fputc((p >> 16) & 255, f); }
+                fclose(f);
+            }
+        }
     }
     if (a->gl) { present_gl(a, img, w, h); return; }
     if (!a->tex || w != a->tex_w || h != a->tex_h) {
