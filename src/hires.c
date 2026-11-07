@@ -33,7 +33,7 @@
 enum { IT_GROUND, IT_LINE, IT_POLY };
 
 typedef struct { float x1, y1, x2, y2; int32_t ix1, iy1, ix2, iy2; uint16_t ord; uint8_t col; } HEdge;
-typedef struct { uint8_t type, col; uint16_t n; uint32_t first; float t0, t1; } HItem;
+typedef struct { uint8_t type, col; uint16_t n; uint32_t first; float t0, t1; float sa, sb; } HItem;
 typedef struct { float x, y; } HVert;
 
 typedef struct {
@@ -364,11 +364,24 @@ void hires_breakpoint(Hires *h, Machine *m, CPU *c) {
     case 0x7621: {
         if (f->ne > h->pass_start) {
             HItem *it = new_item(f, IT_GROUND);
-            /* col = 1: in a steep bank the game renders the ground turned
-             * by 90 degrees ([233E]); that mapping is not known yet, so the
-             * ground then stays as the game drew it */
-            if (it) { it->first = (uint32_t)h->pass_start; it->n = (uint16_t)(f->ne - h->pass_start); it->col = rw(mem, ds + 0x233E) != 0; }
-            if (dbg_on()) fprintf(stderr, "[hires] 7621: [2338]=%d [2593]=%d [2591]=%d [2312]=%d [2314]=%d [2595]=%d [233A]=%d [233C]=%d\n", (int16_t)rw(mem, ds + 0x2338), (int16_t)rw(mem, ds + 0x2593), (int16_t)rw(mem, ds + 0x2591), (int16_t)rw(mem, ds + 0x2312), (int16_t)rw(mem, ds + 0x2314), (int16_t)rw(mem, ds + 0x2595), (int16_t)rw(mem, ds + 0x233A), (int16_t)rw(mem, ds + 0x233C));
+            /* When the aircraft banks, the scanline renderer works in a
+             * sheared frame in which the horizon is level: the edge y is
+             * the screen y plus the height of the horizon above its highest
+             * point at that x. The horizon runs from (9C9, 9CB) to
+             * (9CD, 9CF), y pointing up. Screen y = y + sa*x + sb.
+             * col = 1: in a steep bank (beyond 45 degrees) the renderer works
+             * on columns instead ([233C] = view height); that mapping is not
+             * known yet, so the ground then stays as the game drew it. */
+            if (it) {
+                it->first = (uint32_t)h->pass_start; it->n = (uint16_t)(f->ne - h->pass_start);
+                it->col = (int16_t)rw(mem, ds + 0x233C) != 320;
+                float hx0 = (int16_t)rw(mem, ds + 0x9C9), hy0 = (int16_t)rw(mem, ds + 0x9CB);
+                float hx1 = (int16_t)rw(mem, ds + 0x9CD), hy1 = (int16_t)rw(mem, ds + 0x9CF);
+                float k = hx1 != hx0 ? (hy1 - hy0) / (hx1 - hx0) : 0.f;
+                it->sa = k;
+                it->sb = hy0 - k * hx0 - fmaxf(hy0, hy1) - 0.5f; /* -0.5: measured best fit */
+            }
+            if (dbg_on()) fprintf(stderr, "[hires] 7621: [2338]=%d [2593]=%d [2591]=%d [2312]=%d [2314]=%d [2595]=%d [233A]=%d [233C]=%d [233E]=%d\n", (int16_t)rw(mem, ds + 0x2338), (int16_t)rw(mem, ds + 0x2593), (int16_t)rw(mem, ds + 0x2591), (int16_t)rw(mem, ds + 0x2312), (int16_t)rw(mem, ds + 0x2314), (int16_t)rw(mem, ds + 0x2595), (int16_t)rw(mem, ds + 0x233A), (int16_t)rw(mem, ds + 0x233C), (int16_t)rw(mem, ds + 0x233E));
         }
         h->pass_start = f->ne;
         /* let the CPU mark the pixels the renderer writes */
@@ -604,17 +617,30 @@ static void fill_line(const Target *t, HVert a, HVert b, float half, SpanFn fn, 
     fill_poly(t, q, 4, fn, ctx);
 }
 
-typedef struct { uint8_t col, kind; const int8_t *shade; } PaintCtx;
+/* The game shades the ground by distance: the colour of a ground polygon
+ * gets 0..7 added per row of its scanline renderer. When banking, those rows
+ * run parallel to the horizon (see 7621 in hires_breakpoint). */
+#define SHADE_OFF 256
+#define SHADE_N 768
+static inline int ground_row(float sx, float srow, float sa, float sb) {
+    int g = (int)floorf(srow + sa * sx + sb) + SHADE_OFF;
+    return g < 0 ? 0 : (g >= SHADE_N ? SHADE_N - 1 : g);
+}
+
+typedef struct { uint8_t col, kind; const int8_t *shade; float sa, sb; } PaintCtx;
 
 static void span_paint(const Target *t, int row, int x0, int x1, void *ctx) {
     const PaintCtx *p = ctx;
-    uint8_t c = p->col;
-    if (p->shade) c = (uint8_t)(c + p->shade[row / t->s]);
     uint8_t *d = t->dst + (size_t)row * t->w;
-    if (p->kind == 1 && t->gmask) {
-        const uint8_t *g = t->gmask + (row / t->s) * 320;
-        for (int x = x0; x < x1; x++) if (g[x / t->s]) d[x] = c;
-    } else memset(d + x0, c, (size_t)(x1 - x0));
+    const uint8_t *g = t->gmask && p->kind == 1 ? t->gmask + (row / t->s) * 320 : NULL;
+    if (!p->shade && !g) { memset(d + x0, p->col, (size_t)(x1 - x0)); return; }
+    float srow = (row + 0.5f) / t->s;
+    for (int x = x0; x < x1; x++) {
+        if (g && !g[x / t->s]) continue;
+        uint8_t c = p->col;
+        if (p->shade) c = (uint8_t)(c + p->shade[ground_row((x + 0.5f) / t->s, srow, p->sa, p->sb)]);
+        d[x] = c;
+    }
 }
 
 typedef struct { Hires *h; uint8_t kind, col; } MarkCtx;
@@ -649,17 +675,20 @@ static void draw_items(Hires *h, const HFrame *f, const Target *t, int mark, con
                 for (int i = 0; i < cnt; i++) {
                     if (gone[i]) continue;
                     const HEdge *a = &e[s + i];
+                    HEdge sh = *a;
+                    sh.y1 += it->sa * sh.x1 + it->sb;
+                    sh.y2 += it->sa * sh.x2 + it->sb;
                     for (int j = i + 1; j < cnt; j++) {
                         const HEdge *b = &e[s + j];
                         if (gone[j]) continue;
                         if ((a->ix1 == b->ix1 && a->iy1 == b->iy1 && a->ix2 == b->ix2 && a->iy2 == b->iy2) ||
                             (a->ix1 == b->ix2 && a->iy1 == b->iy2 && a->ix2 == b->ix1 && a->iy2 == b->iy1)) { gone[i] = gone[j] = 1; break; }
                     }
-                    if (!gone[i]) pe[np++] = *a;
+                    if (!gone[i]) pe[np++] = sh;
                 }
                 if (np >= 2) {
                     if (mark) { MarkCtx mc = {h, 1, e[s].col}; fill_edges(t, pe, np, span_mark, &mc); }
-                    else { PaintCtx pc = {e[s].col, 1, shade}; fill_edges(t, pe, np, span_paint, &pc); }
+                    else { PaintCtx pc = {e[s].col, 1, shade, it->sa, it->sb}; fill_edges(t, pe, np, span_paint, &pc); }
                 }
                 s = k;
             }
@@ -669,11 +698,11 @@ static void draw_items(Hires *h, const HFrame *f, const Target *t, int mark, con
             HVert a = {v[0].x + it->t0 * (v[1].x - v[0].x), v[0].y + it->t0 * (v[1].y - v[0].y)};
             HVert b = {v[0].x + it->t1 * (v[1].x - v[0].x), v[0].y + it->t1 * (v[1].y - v[0].y)};
             if (mark) { MarkCtx mc = {h, 2, it->col}; fill_line(t, a, b, 0.5f, span_mark, &mc); }
-            else { PaintCtx pc = {it->col, 2, NULL}; fill_line(t, a, b, 0.45f, span_paint, &pc); }
+            else { PaintCtx pc = {it->col, 2, NULL, 0, 0}; fill_line(t, a, b, 0.45f, span_paint, &pc); }
         } else {
             const HVert *v = f->verts + it->first;
             if (mark) { MarkCtx mc = {h, 3, it->col}; fill_poly(t, v, it->n, span_mark, &mc); }
-            else { PaintCtx pc = {it->col, 3, NULL}; fill_poly(t, v, it->n, span_paint, &pc); }
+            else { PaintCtx pc = {it->col, 3, NULL, 0, 0}; fill_poly(t, v, it->n, span_paint, &pc); }
         }
     }
 }
@@ -719,24 +748,30 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
 
     /* 2. depth shading of the ground per row: the game adds 0..7 to the base
      * colour of a ground polygon depending on the distance */
-    int8_t shade[VIEW_MAX];
-    int have[VIEW_MAX];
-    for (int r = 0; r < vh; r++) {
-        int cnt[16] = {0}, best = -1;
+    /* the shear of the (last) ground pass */
+    float gsa = 0, gsb = 0;
+    for (int i = 0; i < f->ni; i++) if (f->items[i].type == IT_GROUND && !f->items[i].col) { gsa = f->items[i].sa; gsb = f->items[i].sb; }
+    static int8_t shade[SHADE_N];
+    static int shc[SHADE_N][16];
+    int have[SHADE_N];
+    memset(shc, 0, sizeof shc);
+    for (int r = 0; r < vh; r++)
         for (int x = 0; x < W; x++) {
             int i = r * W + x;
             if (h->kind1[i] != 1) continue;
             int d = src[i] - h->base1[i];
-            if (d >= 0 && d < 16) cnt[d]++;
+            if (d >= 0 && d < 16) shc[ground_row(x + 0.5f, r + 0.5f, gsa, gsb)][d]++;
         }
-        for (int d = 0; d < 16; d++) if (cnt[d] && (best < 0 || cnt[d] > cnt[best])) best = d;
-        have[r] = best >= 0;
-        shade[r] = (int8_t)(best >= 0 ? best : 0);
+    for (int g = 0; g < SHADE_N; g++) {
+        int best = -1;
+        for (int d = 0; d < 16; d++) if (shc[g][d] && (best < 0 || shc[g][d] > shc[g][best])) best = d;
+        have[g] = best >= 0;
+        shade[g] = (int8_t)(best >= 0 ? best : 0);
     }
-    for (int r = 0; r < vh; r++) if (!have[r]) {
-        for (int d = 1; d < vh; d++) {
-            if (r - d >= 0 && have[r - d]) { shade[r] = shade[r - d]; break; }
-            if (r + d < vh && have[r + d]) { shade[r] = shade[r + d]; break; }
+    for (int g = 0; g < SHADE_N; g++) if (!have[g]) {
+        for (int d = 1; d < SHADE_N; d++) {
+            if (g - d >= 0 && have[g - d]) { shade[g] = shade[g - d]; break; }
+            if (g + d < SHADE_N && have[g + d]) { shade[g] = shade[g + d]; break; }
         }
     }
 
@@ -787,7 +822,7 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
      * aircraft, smoke, explosions. Those are kept from the game's picture. */
     for (int i = 0; i < W * vh; i++) {
         int k = h->kind1[i];
-        h->exp1[i] = k == 0 ? h->bg1[i] : (uint8_t)(h->base1[i] + (k == 1 ? shade[i / W] : 0));
+        h->exp1[i] = k == 0 ? h->bg1[i] : (uint8_t)(h->base1[i] + (k == 1 ? shade[ground_row(i % W + 0.5f, i / W + 0.5f, gsa, gsb)] : 0));
     }
     for (int r = 0; r < vh; r++)
         for (int x = 0; x < W; x++) {
@@ -837,6 +872,8 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
             if (f->items[i].type == IT_LINE) { nl++; ns += h->skip[i]; }
             if (f->items[i].type == IT_POLY) { np++; nu += f->items[i].col == 0xFF; }
         }
+        { int gk = 0, gm = 0; for (int i = 0; i < W * vh; i++) if (h->kind1[i] == 1) { gk++; gm += h->exp1[i] == src[i]; }
+          fprintf(stderr, "[hires] ground pixels %d match %.1f%%\n", gk, gk ? 100.0 * gm / gk : 0); }
         fprintf(stderr, "[hires] frame %llu items %d edges %d lines %d skipped %d polys %d unconfirmed %d other %d gseg %04X\n",
                 (unsigned long long)f->serial, f->ni, f->ne, nl, ns, np, nu, no, f->gseg);
     }
