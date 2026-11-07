@@ -1,6 +1,6 @@
 # SWOTL Enhanced
 
-Version 0.1.19
+Version 0.1.20
 
 Run **Secret Weapons of the Luftwaffe** (Lucasfilm Games, 1991) on modern Windows
 without installing DOSBox. You need your own copy of the original game files.
@@ -170,10 +170,11 @@ Limits of this first version:
   the 1991 release the setting has no effect and a message says so.
 - Only the forward view from the cockpit. The side, rear and up views, the
   map and the menus are shown as before.
-- The horizon itself stays at the original resolution. In a bank of more
-  than about 45 degrees the game draws the ground column by column; the
-  ground then stays at the original resolution (roads and buildings are
-  still redrawn).
+- In a bank of more than about 45 degrees, and upside down, the game draws
+  the ground in another way; the ground and the horizon then stay at the
+  original resolution (roads and buildings are still redrawn).
+- With ground detail off (Alt+G in the game) the plain ground and the horizon
+  stay at the original resolution.
 - The redrawn view runs one game frame behind the cockpit instruments, so
   that it never mixes old and new pixels.
 - The CRT shader is off while the high-resolution view is on.
