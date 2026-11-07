@@ -64,6 +64,10 @@ struct CPU {
      * wt_map[i] = 1. wt_len = 0: off. */
     uint32_t wt_lo, wt_len;
     uint8_t *wt_map;
+    /* with wt_tag set, a tracked write also stores the 16-bit value at
+     * linear address wt_tag_src in wt_tag[i] (the renderer's scanline) */
+    uint16_t *wt_tag;
+    uint32_t wt_tag_src;
 };
 
 void cpu_reset(CPU *c);

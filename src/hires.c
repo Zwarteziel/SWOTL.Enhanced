@@ -33,7 +33,11 @@
 enum { IT_GROUND, IT_LINE, IT_POLY };
 
 typedef struct { float x1, y1, x2, y2; int32_t ix1, iy1, ix2, iy2; uint16_t ord; uint8_t col; } HEdge;
-typedef struct { uint8_t type, col, orient; uint16_t n; uint32_t first; float t0, t1; float sa, sb, hmax; } HItem;
+/* For a ground pass: m maps a screen point (x, row; game pixels, row
+ * pointing down) to the renderer's frame: u = m0*x + m1*row + m2 (along a
+ * scanline), v = m3*x + m4*row + m5 (the scanline, y up). vtop: its first
+ * scanline, just below the horizon. col = 1: no mapping (left as drawn). */
+typedef struct { uint8_t type, col, orient; uint16_t n; uint32_t first; float t0, t1; float m[6], vtop; } HItem;
 typedef struct { float x, y; } HVert;
 
 typedef struct {
@@ -82,6 +86,8 @@ struct Hires {
     uint8_t skip[MAX_ITEMS];
     uint16_t bufseg[2];  /* the two 3D buffers the game alternates between */
     uint8_t wmap[320 * VIEW_MAX]; /* CPU write tracking map */
+    uint16_t wtag[320 * VIEW_MAX]; /* scanline of each pixel the ground renderer wrote */
+    int gitem;           /* ground item being rendered, -1 = none */
     uint8_t vprev[320 * VIEW_MAX];   /* screen mask of the previous ready frame */
     /* pixels of the screen the game's present routine writes: the 3D view
      * (the cockpit is never written by it), collected over the frames */
@@ -128,6 +134,7 @@ Hires *hires_create(void) {
     h->line_item = -1;
     h->gen = 1;
     h->pending_poly = h->pending_line = -1;
+    h->gitem = -1;
     for (size_t i = 0; i < sizeof bps / sizeof bps[0]; i++) h->bpmap[bps[i] >> 3] |= (uint8_t)(1 << (bps[i] & 7));
     return h;
 }
@@ -180,6 +187,7 @@ void hires_detach(Hires *h, Machine *m) {
     (void)h;
     m->cpu.bp_cs = 0;
     m->cpu.wt_len = 0;
+    m->cpu.wt_tag = NULL;
 }
 
 /* ------------------------------------------------------------- capture */
@@ -260,7 +268,16 @@ static void rerun_projection(Hires *h, Machine *m, CPU *c) {
     *c = save;
     if (n >= 20000) return;
 
+    /* In the orientations on columns the x the projection gives is measured
+     * from the vertical centre instead ([2595]..., also mirrored); take the
+     * centre that agrees with the game's own value */
+    double cxs[3] = {cx, (int16_t)rw(mem, ds + 0x2595) + (int16_t)rw(mem, ds + 0x2312) - (int16_t)rw(mem, ds + 0x2314),
+                     (int16_t)rw(mem, ds + 0x2595) - (int16_t)rw(mem, ds + 0x2312) + (int16_t)rw(mem, ds + 0x2314)};
     double fx = (xn - cx) / N + cx, fy = (yn - cy) / N + cy;
+    for (int i = 1; i < 3; i++) {
+        double gx = (xn - cxs[i]) / N + cxs[i];
+        if (fabs(gx - (x1 + 0.5)) < fabs(fx - (x1 + 0.5))) fx = gx;
+    }
     /* safety net: a rare edge case of the long route differs by a pixel */
     if (fabs(fx - x1) > 1.2) fx = x1;
     if (fabs(fy - y1) > 1.6) fy = y1 + 0.5;
@@ -301,6 +318,7 @@ static void region_start(Hires *h, Machine *m, uint32_t ds, HFrame *f, int item)
     uint32_t len = 320u * (uint32_t)(y1 - y0 + 1);
     memset(h->wmap, 0, len);
     m->cpu.wt_map = h->wmap;
+    m->cpu.wt_tag = NULL;
     m->cpu.wt_lo = ((uint32_t)bseg << 4) + 320u * (uint32_t)y0;
     m->cpu.wt_len = len;
 }
@@ -343,6 +361,69 @@ static void region_end(Hires *h, Machine *m, uint32_t ds, HFrame *f) {
     }
 }
 
+/* The position along a scanline: the projection turns the picture, so it is
+ * the screen x or the row, either way round (by orientation; measured). */
+static const float ORIENT_U[8][3] = {
+    {1, 0, 0}, {1, 0, 0}, {-1, 0, 320}, {-1, 0, 320},
+    {0, -1, 104}, {0, 1, 0}, {0, -1, 104}, {0, 1, 0},
+};
+/* the scanline v of a pixel centre is floor(v) for the continuous v */
+#define V_OFF 1.5f
+
+/* Fits v = a*x + b*row + c to the scanlines of the pixels the renderer wrote.
+ * Scanlines that cover far more pixels than the others are the renderer
+ * filling the rest of the view at once; those are left out. */
+static void fit_ground(Hires *h, HItem *it, int rows) {
+    static int cnt[1024];
+    memset(cnt, 0, sizeof cnt);
+    int n = 0;
+    for (int i = 0; i < 320 * rows; i++)
+        if (h->wmap[i] && h->wtag[i] < 1024) { cnt[h->wtag[i]]++; n++; }
+    if (n < 200) return;
+    /* typical pixels per scanline: the 75th percentile of the counts */
+    static int srt[1024]; int ns = 0;
+    for (int v = 0; v < 1024; v++) if (cnt[v]) srt[ns++] = cnt[v];
+    for (int i = 1; i < ns; i++) { int t = srt[i], j = i; while (j > 0 && srt[j - 1] > t) { srt[j] = srt[j - 1]; j--; } srt[j] = t; }
+    int lim = srt[ns * 3 / 4] * 3 / 2 + 2;
+    double p[3] = {0, 0, 0};
+    float lim_res = 1e9f;
+    for (int pass = 0; pass < 3; pass++) {
+        double s[3][3] = {{0}}, r[3] = {0};
+        int k = 0;
+        for (int i = 0; i < 320 * rows; i++) {
+            if (!h->wmap[i] || h->wtag[i] >= 1024 || cnt[h->wtag[i]] > lim) continue;
+            double X = i % 320 + 0.5, R = i / 320 + 0.5, v = h->wtag[i], q[3] = {X, R, 1};
+            if (pass && fabs(p[0] * X + p[1] * R + p[2] - v) > lim_res) continue;
+            for (int a = 0; a < 3; a++) { r[a] += q[a] * v; for (int b = 0; b < 3; b++) s[a][b] += q[a] * q[b]; }
+            k++;
+        }
+        if (k < 100) return;
+        /* solve the 3x3 normal equations (Cramer) */
+        double det = s[0][0] * (s[1][1] * s[2][2] - s[1][2] * s[2][1]) - s[0][1] * (s[1][0] * s[2][2] - s[1][2] * s[2][0]) + s[0][2] * (s[1][0] * s[2][1] - s[1][1] * s[2][0]);
+        if (fabs(det) < 1e-9) return;
+        for (int c = 0; c < 3; c++) {
+            double t[3][3];
+            memcpy(t, s, sizeof t);
+            for (int a = 0; a < 3; a++) t[a][c] = r[a];
+            p[c] = (t[0][0] * (t[1][1] * t[2][2] - t[1][2] * t[2][1]) - t[0][1] * (t[1][0] * t[2][2] - t[1][2] * t[2][0]) + t[0][2] * (t[1][0] * t[2][1] - t[1][1] * t[2][0])) / det;
+        }
+        lim_res = 1.0f;
+    }
+    /* check: nearly all pixels within one scanline of the fit */
+    int ok = 0, all = 0;
+    for (int i = 0; i < 320 * rows; i++) {
+        if (!h->wmap[i] || h->wtag[i] >= 1024 || cnt[h->wtag[i]] > lim) continue;
+        all++;
+        ok += fabs(p[0] * (i % 320 + 0.5) + p[1] * (i / 320 + 0.5) + p[2] - h->wtag[i]) <= 1.0;
+    }
+    if (dbg_on()) fprintf(stderr, "[hires] ground fit orient %d: v = %.4f x + %.4f row + %.2f, %d px, %.1f%% within 1\n", it->orient, p[0], p[1], p[2], all, all ? 100.0 * ok / all : 0);
+    if (!all || ok < all * 0.95) return;
+    const float *u = ORIENT_U[it->orient];
+    it->m[0] = u[0]; it->m[1] = u[1]; it->m[2] = u[2];
+    it->m[3] = (float)p[0]; it->m[4] = (float)p[1]; it->m[5] = (float)p[2] + V_OFF;
+    it->col = 0;
+}
+
 void hires_breakpoint(Hires *h, Machine *m, CPU *c) {
     HFrame *f = &h->fr[h->cur];
     uint8_t *mem = m->mem;
@@ -368,43 +449,36 @@ void hires_breakpoint(Hires *h, Machine *m, CPU *c) {
         break;
     }
     case 0x7621: {
+        h->gitem = -1;
         if (f->ne > h->pass_start) {
             HItem *it = new_item(f, IT_GROUND);
-            /* When the aircraft banks, the scanline renderer works in a
-             * sheared frame in which the horizon is level: the edge y is
-             * the screen y plus the height of the horizon above its highest
-             * point at that x. The horizon runs from (9C9, 9CB) to
-             * (9CD, 9CF), y pointing up. Screen y = y + sa*x + sb.
-             * col = 1: in a steep bank (beyond 45 degrees) the renderer works
-             * on columns instead ([233C] = view height), and upside down it
-             * works from the other side; those mappings are not known yet,
-             * so the ground then stays as the game drew it. */
+            /* The scanline renderer works in a frame of its own: the
+             * projection already turns the picture by 0, 90, 180 or 270
+             * degrees (one of eight orientations, [25D0]), and the renderer
+             * fills rows of that frame that run parallel to the horizon,
+             * each shifted a little (a shear). The mapping to the screen is
+             * measured from the pixels it writes (see 769A). */
             if (it) {
                 it->first = (uint32_t)h->pass_start; it->n = (uint16_t)(f->ne - h->pass_start);
-                /* which of the eight orientations the renderer uses: 0 and 1
-                 * are upright, 2 and 3 upside down, 4 to 7 on columns. Only
-                 * the upright ones are redrawn. */
                 it->orient = (uint8_t)(rw(mem, ds + 0x25D0) & 7);
-                it->col = (int16_t)rw(mem, ds + 0x233C) != 320 || it->orient >= 2;
-                float hx0 = (int16_t)rw(mem, ds + 0x9C9), hy0 = (int16_t)rw(mem, ds + 0x9CB);
-                float hx1 = (int16_t)rw(mem, ds + 0x9CD), hy1 = (int16_t)rw(mem, ds + 0x9CF);
-                float k = hx1 != hx0 ? (hy1 - hy0) / (hx1 - hx0) : 0.f;
-                it->sa = k;
-                /* the renderer's shear behaves like k * (x - 0.8) - 0.1 for
-                 * a pixel centre x (measured best fit, both directions) */
-                it->sb = hy0 - k * hx0 - fmaxf(hy0, hy1) - 0.6f - 0.8f * k;
-                it->hmax = fmaxf(hy0, hy1);
+                it->vtop = (int16_t)rw(mem, ds + 0x2338);
+                it->col = 1;
+                /* with ground detail off ([233E] = 0, Alt+G) the ground is
+                 * drawn plainly, without this frame: left as drawn */
+                h->gitem = rw(mem, ds + 0x233E) ? f->ni - 1 : -1;
             }
-            if (dbg_on()) fprintf(stderr, "[hires] 7621: [2338]=%d [2593]=%d [2591]=%d [2312]=%d [2314]=%d [2595]=%d [233A]=%d [233C]=%d [233E]=%d\n", (int16_t)rw(mem, ds + 0x2338), (int16_t)rw(mem, ds + 0x2593), (int16_t)rw(mem, ds + 0x2591), (int16_t)rw(mem, ds + 0x2312), (int16_t)rw(mem, ds + 0x2314), (int16_t)rw(mem, ds + 0x2595), (int16_t)rw(mem, ds + 0x233A), (int16_t)rw(mem, ds + 0x233C), (int16_t)rw(mem, ds + 0x233E));
+            if (dbg_on()) fprintf(stderr, "[hires] 7621: [2338]=%d [233A]=%d [233C]=%d [233E]=%d [25D0]=%d\n", (int16_t)rw(mem, ds + 0x2338), (int16_t)rw(mem, ds + 0x233A), (int16_t)rw(mem, ds + 0x233C), (int16_t)rw(mem, ds + 0x233E), rw(mem, ds + 0x25D0));
         }
         h->pass_start = f->ne;
-        /* let the CPU mark the pixels the renderer writes */
+        /* let the CPU mark the pixels the renderer writes, with the
+         * scanline ([23FF]) of each */
         int rows = (int16_t)rw(mem, ds + 0x2591);
         uint16_t bseg = rw(mem, ds + 0x2579);
         h->wrows = 0;
         if (rows > 0 && rows <= VIEW_MAX && bseg && ((uint32_t)bseg << 4) + 320u * rows <= 0xA0000) {
             memset(h->wmap, 0, 320u * rows);
             c->wt_map = h->wmap; c->wt_lo = (uint32_t)bseg << 4; c->wt_len = 320u * rows;
+            c->wt_tag = h->wtag; c->wt_tag_src = ds + 0x23FF;
             h->wseg = bseg; h->wrows = rows;
         }
         break;
@@ -412,10 +486,13 @@ void hires_breakpoint(Hires *h, Machine *m, CPU *c) {
     case 0x769A: {
         int rows = c->wt_len ? h->wrows : 0;
         c->wt_len = 0;
+        c->wt_tag = NULL;
         if (!rows) break;
         const uint8_t *b = mem + ((uint32_t)h->wseg << 4);
         if (f->gseg != h->wseg) { memset(f->gmask, 0, sizeof f->gmask); f->gseg = h->wseg; }
         for (int i = 0; i < 320 * rows; i++) if (h->wmap[i]) { f->gmask[i] = 1; f->gval[i] = b[i]; }
+        if (h->gitem >= 0 && h->gitem < f->ni) fit_ground(h, &f->items[h->gitem], rows);
+        h->gitem = -1;
         break;
     }
     case 0x7B42: {
@@ -508,7 +585,7 @@ void hires_present(Hires *h, Machine *m, CPU *c) {
     if (h->found > 0 && vw == 320 && vh > 8 && vh <= VIEW_MAX && !c->wt_len) {
         uint32_t sp = ss + c->r[SP];
         memset(h->pwmap, 0, 320u * vh);
-        c->wt_map = h->pwmap; c->wt_lo = 0xA0000; c->wt_len = 320u * vh;
+        c->wt_map = h->pwmap; c->wt_tag = NULL; c->wt_lo = 0xA0000; c->wt_len = 320u * vh;
         c->ret_lin = ((uint32_t)rw(m->mem, sp + 2) << 4) + rw(m->mem, sp);
         c->ret_sp = 0xFFFF;
         h->pw_rows = vh;
@@ -601,8 +678,9 @@ typedef struct {
     float bot;
     const uint8_t *gmask;         /* where ground may be drawn (320 wide), or NULL */
     /* game pixels along the horizon (bgk == BG_HORIZON): there the ground
-     * ends exactly at y = hk * x + hc instead of at the game's pixels */
-    const uint8_t *bgk; float hk, hc;
+     * ends exactly at scanline vh (mapping gm) instead of at the game's
+     * pixels */
+    const uint8_t *bgk; const float *gm; float vh;
 } Target;
 
 enum { BG_GAME, BG_GROUND, BG_HORIZON };
@@ -663,15 +741,16 @@ static void fill_line(const Target *t, HVert a, HVert b, float half, SpanFn fn, 
 }
 
 /* The game shades the ground by distance: the colour of a ground polygon
- * gets 0..7 added per row of its scanline renderer. When banking, those rows
- * run parallel to the horizon (see 7621 in hires_breakpoint). */
+ * gets 0..7 added per scanline of its renderer. When banking, those
+ * scanlines run parallel to the horizon. */
 #define SHADE_OFF 256
 #define SHADE_N 768
-/* the horizon lies HZ_TOP above the highest ground row ([233A] - 1) of the
- * renderer's sheared frame (measured) */
-#define HZ_TOP 2.1f
-static inline int ground_row(float sx, float srow, float sa, float sb) {
-    int g = (int)floorf(srow + sa * sx + sb) + SHADE_OFF;
+/* the exact horizon lies HZ_V above the renderer's first scanline (measured) */
+#define HZ_V 0.0f
+static inline float map_v(const float *m, float x, float row) { return m[3] * x + m[4] * row + m[5]; }
+static inline float map_u(const float *m, float x, float row) { return m[0] * x + m[1] * row + m[2]; }
+static inline int ground_row(float v) {
+    int g = (int)floorf(v) + SHADE_OFF;
     return g < 0 ? 0 : (g >= SHADE_N ? SHADE_N - 1 : g);
 }
 
@@ -698,13 +777,14 @@ static void span_sfill(const Target *t, int row, int x0, int x1, void *ctx) {
     for (int x = x0; x < x1; x++) d[x] = (uint16_t)(p->col + 1);
 }
 
-/* The scanline renderer fills the ground in a sheared frame in which the
- * horizon is level (screen y = y + sa*x + sb), along rows of that frame,
- * and it ignores horizontal edges: its edge lists only describe closed
- * shapes in that sense. So the shapes are filled in that frame too, and then
- * moved onto the screen column by column. */
+/* The scanline renderer fills the ground in its own frame (u along a
+ * scanline, v the scanline; see 7621), and it ignores horizontal edges: its
+ * edge lists only describe closed shapes in that sense. So the shapes are
+ * filled in that frame too, and every screen pixel then looks up where it
+ * lies in that frame. */
 static void draw_ground(Hires *h, const HFrame *f, const HItem *it, const Target *t, int mark, const int8_t *shade) {
     const HEdge *e = f->edges + it->first;
+    const float *gm = it->m;
     int n = it->n, s = t->s;
     float ymin = 1e9f, ymax = -1e9f;
     for (int i = 0; i < n; i++) {
@@ -712,16 +792,23 @@ static void draw_ground(Hires *h, const HFrame *f, const HItem *it, const Target
         ymax = fmaxf(ymax, fmaxf(e[i].y1, e[i].y2));
     }
     if (n < 2 || ymax < ymin) return;
-    /* only the part of the frame that can reach the screen */
-    float o0 = it->sb, o1 = it->sa * (float)t->w / s + it->sb;
-    float vtop = t->bot - fminf(o0, o1), vbot = t->bot - (float)t->h / s - fmaxf(o0, o1);
-    ymax = fminf(ymax, vtop + 1.f);
-    ymin = fmaxf(ymin, vbot - 1.f);
+    /* only the part of the frame that the screen shows */
+    float W = (float)t->w / s, H = (float)t->h / s;
+    float cu[4] = {map_u(gm, 0, 0), map_u(gm, W, 0), map_u(gm, 0, H), map_u(gm, W, H)};
+    float cv[4] = {map_v(gm, 0, 0), map_v(gm, W, 0), map_v(gm, 0, H), map_v(gm, W, H)};
+    float umin = 1e9f, umax = -1e9f, vmin = 1e9f, vmax = -1e9f;
+    for (int i = 0; i < 4; i++) {
+        umin = fminf(umin, cu[i]); umax = fmaxf(umax, cu[i]);
+        vmin = fminf(vmin, cv[i]); vmax = fmaxf(vmax, cv[i]);
+    }
+    umin = floorf(umin) - 1.f; umax = ceilf(umax) + 1.f;
+    ymax = fminf(ymax, vmax + 1.f);
+    ymin = fmaxf(ymin, vmin - 1.f);
     if (ymax < ymin) return;
     float sbot = ceilf(ymax) + 1.f;
-    int sh = (int)((sbot - floorf(ymin) + 2.f) * s);
-    if (sh <= 0 || sh > 4096) return;
-    size_t need = (size_t)t->w * sh;
+    int sw = (int)((umax - umin) * s), sh = (int)((sbot - floorf(ymin) + 2.f) * s);
+    if (sw <= 0 || sh <= 0 || sw > 4096 || sh > 4096) return;
+    size_t need = (size_t)sw * sh;
     if (h->sbuf_size < need) {
         free(h->sbuf);
         h->sbuf = malloc(need * sizeof *h->sbuf);
@@ -729,7 +816,7 @@ static void draw_ground(Hires *h, const HFrame *f, const HItem *it, const Target
         h->sbuf_size = need;
     }
     memset(h->sbuf, 0, need * sizeof *h->sbuf);
-    Target ts = {NULL, t->w, sh, s, sbot, NULL, NULL, 0, 0};
+    Target ts = {NULL, sw, sh, s, sbot, NULL, NULL, NULL, 0};
     /* consecutive edges with the same polygon number form a polygon */
     int a0 = 0;
     while (a0 < n) {
@@ -750,30 +837,26 @@ static void draw_ground(Hires *h, const HFrame *f, const HItem *it, const Target
                 if ((a->ix1 == b->ix1 && a->iy1 == b->iy1 && a->ix2 == b->ix2 && a->iy2 == b->iy2) ||
                     (a->ix1 == b->ix2 && a->iy1 == b->iy2 && a->ix2 == b->ix1 && a->iy2 == b->iy1)) { gone[i] = gone[j] = 1; break; }
             }
-            if (!gone[i]) pe[np++] = *a;
+            if (!gone[i]) { pe[np] = *a; pe[np].x1 -= umin; pe[np].x2 -= umin; np++; }
         }
         if (np >= 2) { SFillCtx sc = {h->sbuf, e[a0].col}; fill_edges(&ts, pe, np, span_sfill, &sc); }
         a0 = k;
     }
-    /* onto the screen: a column of the sheared frame is a column of the
-     * screen moved up or down */
-    for (int x = 0; x < t->w; x++) {
-        float X = (x + 0.5f) / s, off = it->sa * X + it->sb;
-        int r0 = (int)floorf((t->bot - (sbot + off)) * s), r1 = (int)ceilf((t->bot - (ymin - 1.f + off)) * s);
-        if (r0 < 0) r0 = 0;
-        if (r1 > t->h) r1 = t->h;
-        for (int r = r0; r < r1; r++) {
-            float srow = (r + 0.5f) / s, Y = t->bot - srow;
-            int rs = (int)floorf((sbot - (Y - off)) * s);
-            if (rs < 0 || rs >= sh) continue;
-            uint16_t v = h->sbuf[(size_t)rs * t->w + x];
-            if (!v) continue;
-            uint8_t col = (uint8_t)(v - 1);
+    /* onto the screen */
+    for (int r = 0; r < t->h; r++) {
+        float R = (r + 0.5f) / s;
+        for (int x = 0; x < t->w; x++) {
+            float X = (x + 0.5f) / s, u = map_u(gm, X, R), v = map_v(gm, X, R);
+            int iu = (int)floorf((u - umin) * s), rs = (int)floorf((sbot - v) * s);
+            if (iu < 0 || iu >= sw || rs < 0 || rs >= sh) continue;
+            uint16_t c = h->sbuf[(size_t)rs * sw + iu];
+            if (!c) continue;
+            uint8_t col = (uint8_t)(c - 1);
             int gi = (r / s) * 320 + x / s;
-            if (t->bgk && t->bgk[gi] == BG_HORIZON) { if (Y >= t->hk * X + t->hc) continue; }
+            if (t->bgk && t->bgk[gi] == BG_HORIZON) { if (map_v(t->gm, X, R) >= t->vh) continue; }
             else if (t->gmask && !t->gmask[gi]) continue;
             if (mark) { h->kind1[gi] = 1; h->base1[gi] = col; }
-            else t->dst[(size_t)r * t->w + x] = shade ? (uint8_t)(col + shade[ground_row(X, srow, it->sa, it->sb)]) : col;
+            else t->dst[(size_t)r * t->w + x] = shade ? (uint8_t)(col + shade[ground_row(v)]) : col;
         }
     }
 }
@@ -835,15 +918,22 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
     memset(h->skip, 0, sizeof h->skip);
 
     /* 1. coverage at the game's resolution */
-    Target t1 = {NULL, W, vh, 1, f->bot, f->gmask, NULL, 0, 0};
+    Target t1 = {NULL, W, vh, 1, f->bot, f->gmask, NULL, NULL, 0};
     memset(h->kind1, 0, (size_t)W * vh);
     draw_items(h, f, &t1, 1, NULL);
 
     /* 2. depth shading of the ground per row: the game adds 0..7 to the base
      * colour of a ground polygon depending on the distance */
-    /* the shear of the (last) ground pass */
-    float gsa = 0, gsb = 0;
-    for (int i = 0; i < f->ni; i++) if (f->items[i].type == IT_GROUND && !f->items[i].col) { gsa = f->items[i].sa; gsb = f->items[i].sb; }
+    /* the mapping of the (last) ground pass */
+    static const float gm0[6] = {1, 0, 0, 0, -1, 0};
+    const float *gm = gm0;
+    float gvtop = 0;
+    int gfound = 0;
+    for (int i = 0; i < f->ni; i++) if (f->items[i].type == IT_GROUND) {
+        gfound = !f->items[i].col;
+        if (gfound) { gm = f->items[i].m; gvtop = f->items[i].vtop; }
+    }
+#define GROW(x, row) ground_row(map_v(gm, (x), (row)))
     static int8_t shade[SHADE_N];
     static int shc[SHADE_N][16];
     int have[SHADE_N];
@@ -853,7 +943,7 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
             int i = r * W + x;
             if (h->kind1[i] != 1) continue;
             int d = src[i] - h->base1[i];
-            if (d >= 0 && d < 16) shc[ground_row(x + 0.5f, r + 0.5f, gsa, gsb)][d]++;
+            if (d >= 0 && d < 16) shc[GROW(x + 0.5f, r + 0.5f)][d]++;
         }
     for (int g = 0; g < SHADE_N; g++) {
         int best = -1;
@@ -867,9 +957,6 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
             if (g + d < SHADE_N && have[g + d]) { shade[g] = shade[g + d]; break; }
         }
     }
-    /* the horizon of the (last) ground pass, y up: Yh(x) = gsa*x + ghc */
-    float ghc = 0; int gcol = 1, gorient = 0;
-    for (int i = 0; i < f->ni; i++) if (f->items[i].type == IT_GROUND) { gcol = f->items[i].col; gorient = f->items[i].orient; ghc = f->items[i].sb + f->items[i].hmax; }
     int gbase;
     /* the bare ground (no polygon) has its own colour with the same shading:
      * the most common colour minus shade where the renderer drew nothing
@@ -880,7 +967,7 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
         if (f->gok)
             for (int i = 0; i < W * vh; i++)
                 if (f->gmask[i] && !h->kind1[i] && src[i] == f->gval[i])
-                    bc[(uint8_t)(src[i] - shade[ground_row(i % W + 0.5f, i / W + 0.5f, gsa, gsb)])]++;
+                    bc[(uint8_t)(src[i] - shade[GROW(i % W + 0.5f, i / W + 0.5f)])]++;
         int best = -1;
         for (int c = 0; c < 256; c++) if (bc[c] && (best < 0 || bc[c] > bc[best])) best = c;
         gbase = best;
@@ -894,7 +981,7 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
         memset(shc, 0, sizeof shc);
         for (int i = 0; i < W * vh; i++) {
             if (!f->gmask[i] || src[i] != f->gval[i]) continue;
-            int g = ground_row(i % W + 0.5f, i / W + 0.5f, gsa, gsb);
+            int g = GROW(i % W + 0.5f, i / W + 0.5f);
             int d = src[i] - gbase;
             if (!h->kind1[i] && d >= 0 && d < 16) shc[g][d]++;
         }
@@ -960,11 +1047,11 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
      * shows the bare ground colour (gbase plus the shading); taking those
      * pixels from the game's picture would bring back its staircase edges
      * next to the redrawn shapes. Along the horizon the ground ends at the
-     * exact horizon line instead of at the game's pixels. Only upright and
-     * when the renderer's pixels are known. */
+     * exact horizon line instead of at the game's pixels. Only when the
+     * mapping and the renderer's pixels are known. */
     memset(h->bgk1, BG_GAME, (size_t)W * vh);
-    float hzc = ghc + HZ_TOP;
-    int precise = !gcol && gorient < 2 && f->gok && gbase >= 0;
+    float gvh = gvtop + HZ_V;
+    int precise = gfound && f->gok && gbase >= 0;
     if (precise) {
         /* near[]: within 3 pixels of a redrawn ground shape (sky1 as scratch) */
         uint8_t *rowmax = h->exp1, *near = h->sky1;
@@ -980,12 +1067,12 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
                 for (int dy = -3; dy <= 3 && !v; dy++) { int yy = r + dy; if (yy >= 0 && yy < vh && rowmax[yy * W + x]) v = 1; }
                 near[r * W + x] = (uint8_t)v;
             }
-        float band = 0.5f * (1.f + fabsf(gsa)) + 0.75f;
+        float band = 0.5f * (fabsf(gm[3]) + fabsf(gm[4])) + 0.75f;
         for (int r = 0; r < vh; r++)
             for (int x = 0; x < W; x++) {
                 int i = r * W + x;
-                float X = x + 0.5f, Y = f->bot - (r + 0.5f), d = Y - (gsa * X + hzc);
-                int gr = ground_row(X, r + 0.5f, gsa, gsb), bare = BARE(gr);
+                float v = map_v(gm, x + 0.5f, r + 0.5f), d = v - gvh;
+                int gr = ground_row(v), bare = BARE(gr);
                 if (fabsf(d) < band) {
                     h->bgk1[i] = BG_HORIZON;
                     if (d < 0) h->bg1[i] = (uint8_t)bare;
@@ -1006,7 +1093,7 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
                     else if (x + dd < W && h->bgk1[i + dd] == BG_GAME && !f->gmask[i + dd] && !h->other1[i + dd]) best = i + dd;
                 }
                 h->sky1[i] = best >= 0 ? src[best] : r > 0 ? (h->bgk1[i - W] == BG_HORIZON ? h->sky1[i - W] : h->bg1[i - W]) : src[i];
-                if (f->bot - (r + 0.5f) >= gsa * (x + 0.5f) + hzc) h->bg1[i] = h->sky1[i];
+                if (map_v(gm, x + 0.5f, r + 0.5f) >= gvh) h->bg1[i] = h->sky1[i];
             }
     }
 
@@ -1015,7 +1102,7 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
      * aircraft, smoke, explosions. Those are kept from the game's picture. */
     for (int i = 0; i < W * vh; i++) {
         int k = h->kind1[i];
-        h->exp1[i] = k == 0 ? h->bg1[i] : (uint8_t)(h->base1[i] + (k == 1 ? shade[ground_row(i % W + 0.5f, i / W + 0.5f, gsa, gsb)] : 0));
+        h->exp1[i] = k == 0 ? h->bg1[i] : (uint8_t)(h->base1[i] + (k == 1 ? shade[GROW(i % W + 0.5f, i / W + 0.5f)] : 0));
     }
     for (int r = 0; r < vh; r++)
         for (int x = 0; x < W; x++) {
@@ -1049,18 +1136,17 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
     for (int r = 0; r < HH; r++) {
         const uint8_t *b = h->bg1 + (r / n) * W, *k = h->bgk1 + (r / n) * W, *sk = h->sky1 + (r / n) * W;
         uint8_t *d = h->hidx + (size_t)r * HW;
-        float srow = (r + 0.5f) / n, yh = f->bot - srow - hzc;
+        float R = (r + 0.5f) / n;
         for (int x = 0; x < W; x++) {
             if (k[x] == BG_GAME) { memset(d + x * n, b[x], (size_t)n); continue; }
             for (int xx = 0; xx < n; xx++) {
-                float X = (x * n + xx + 0.5f) / n;
-                int ground = k[x] == BG_GROUND || yh < gsa * X;
-                int gr = ground_row(X, srow, gsa, gsb);
-                d[x * n + xx] = ground ? (uint8_t)BARE(gr) : sk[x];
+                float X = (x * n + xx + 0.5f) / n, v = map_v(gm, X, R);
+                int ground = k[x] == BG_GROUND || v < gvh;
+                d[x * n + xx] = ground ? (uint8_t)BARE(ground_row(v)) : sk[x];
             }
         }
     }
-    Target tn = {h->hidx, HW, HH, n, f->bot, f->gmask, precise ? h->bgk1 : NULL, gsa, hzc};
+    Target tn = {h->hidx, HW, HH, n, f->bot, f->gmask, precise ? h->bgk1 : NULL, gm, gvh};
     draw_items(h, f, &tn, 0, shade);
     for (int r = 0; r < vh; r++)
         for (int x = 0; x < W; x++)
@@ -1075,7 +1161,7 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
             if (f->items[i].type == IT_POLY) { np++; nu += f->items[i].col == 0xFF; }
         }
         { int bk = 0, bm = 0;
-          if (gbase >= 0) for (int i = 0; i < W * vh; i++) if (f->gok && f->gmask[i] && !h->kind1[i] && src[i] == f->gval[i]) { bk++; bm += src[i] == BARE(ground_row(i % W + 0.5f, i / W + 0.5f, gsa, gsb)); }
+          if (gbase >= 0) for (int i = 0; i < W * vh; i++) if (f->gok && f->gmask[i] && !h->kind1[i] && src[i] == f->gval[i]) { bk++; bm += src[i] == BARE(GROW(i % W + 0.5f, i / W + 0.5f)); }
           fprintf(stderr, "[hires] bare ground %d px, base %d match %.1f%%", bk, gbase, bk ? 100.0 * bm / bk : 0);
           { int unk = 0; for (int i = 0; i < W * vh; i++) unk += f->gok && f->gmask[i] && src[i] == f->gval[i] && h->bgk1[i] == BG_GAME && !h->kind1[i]; fprintf(stderr, " unknown %d", unk); }
           fprintf(stderr, "\n"); }
