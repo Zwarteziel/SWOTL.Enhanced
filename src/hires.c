@@ -115,10 +115,11 @@ static const struct { uint16_t off; uint8_t len; uint8_t b[12]; } sigs[] = {
     {0x7693, 8, {0x07, 0x5E, 0x5F, 0xA1, 0xFF, 0x23, 0x5D, 0xCB}},
     {0x911F, 4, {0x5E, 0x5F, 0x5D, 0xCB}},
     {0x7EB2, 4, {0x5E, 0x5F, 0x5D, 0xCB}},
+    {0x7EB6, 10, {0xBE, 0x45, 0x24, 0xBB, 0x00, 0x00, 0x8B, 0x0E, 0x79, 0x23}},
     {0x7B62, 4, {0x8E, 0x06, 0x79, 0x25}},
     {0x8D38, 4, {0x8E, 0x06, 0x79, 0x25}},
 };
-static const uint16_t bps[] = {0x663F, 0x8A8B, 0x8C6B, 0x7FB2, 0x7621, 0x7B42, 0x7BBF, 0x8CEC, 0x8D26, 0x769A, 0x9122, 0x7EB5};
+static const uint16_t bps[] = {0x7EB6, 0x663F, 0x8A8B, 0x8C6B, 0x7FB2, 0x7621, 0x7B42, 0x7BBF, 0x8CEC, 0x8D26, 0x769A, 0x9122, 0x7EB5};
 
 Hires *hires_create(void) {
     Hires *h = calloc(1, sizeof *h);
@@ -432,6 +433,32 @@ void hires_breakpoint(Hires *h, Machine *m, CPU *c) {
         }
         it->col = 0xFF; /* not drawn unless confirmed */
         h->pending_poly = f->ni - 1;
+        region_start(h, m, ds, f, f->ni - 1);
+        break;
+    }
+    case 0x7EB6: {
+        /* a polygon with flags 15 (small or far away) is drawn as one
+         * horizontal span: from the leftmost to the rightmost corner, on
+         * the row of the first corner (list DS:2445, [2379] corners). It
+         * is redrawn as a band one game pixel high. */
+        h->pending_poly = -1;
+        int n = (int16_t)rw(mem, ds + 0x2379);
+        if (n < 1 || n > 32 || f->nv + 4 > MAX_VERTS) break;
+        float x0 = 1e9f, x1 = -1e9f, y = 0;
+        for (int i = 0; i < n; i++) {
+            uint32_t v = ds + (uint16_t)(0x2445 + 8 * i);
+            HVert p = lookup(h, rd32(mem, v), rd32(mem, v + 4));
+            if (i == 0) y = p.y;
+            x0 = fminf(x0, p.x); x1 = fmaxf(x1, p.x);
+        }
+        HItem *it = new_item(f, IT_POLY);
+        if (!it) break;
+        it->first = (uint32_t)f->nv; it->n = 4;
+        f->verts[f->nv++] = (HVert){x0, y};
+        f->verts[f->nv++] = (HVert){x1 + 1.f, y};
+        f->verts[f->nv++] = (HVert){x1 + 1.f, y + 1.f};
+        f->verts[f->nv++] = (HVert){x0, y + 1.f};
+        it->col = (uint8_t)rw(mem, ds + 0x23D9);
         region_start(h, m, ds, f, f->ni - 1);
         break;
     }
