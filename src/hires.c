@@ -37,7 +37,7 @@ typedef struct { float x1, y1, x2, y2; int32_t ix1, iy1, ix2, iy2; uint16_t ord;
  * pointing down) to the renderer's frame: u = m0*x + m1*row + m2 (along a
  * scanline), v = m3*x + m4*row + m5 (the scanline, y up). vtop: its first
  * scanline, just below the horizon. col = 1: no mapping (left as drawn). */
-typedef struct { uint8_t type, col, orient; uint16_t n; uint32_t first; float t0, t1; float m[6], vtop, refx, refy; } HItem;
+typedef struct { uint8_t type, col, orient; uint16_t n; uint32_t first; float t0, t1; float m[6], vtop, refx, refy; int16_t refix, refiy; } HItem;
 typedef struct { float x, y; } HVert;
 
 typedef struct {
@@ -88,6 +88,7 @@ struct Hires {
     uint8_t wmap[320 * VIEW_MAX]; /* CPU write tracking map */
     uint16_t wtag[320 * VIEW_MAX]; /* scanline of each pixel the ground renderer wrote */
     int gitem;           /* ground item being rendered, -1 = none */
+    float kref; int kref_n; uint64_t kref_serial; /* horizon below the point ahead */
     uint8_t vprev[320 * VIEW_MAX];   /* screen mask of the previous ready frame */
     /* pixels of the screen the game's present routine writes: the 3D view
      * (the cockpit is never written by it), collected over the frames */
@@ -217,7 +218,7 @@ static HVert lookup(Hires *h, int32_t x, int32_t y) {
     return (HVert){(float)x, (float)y + 0.5f};
 }
 
-#define SB_N 4
+#define SB_N 16
 
 /* Runs the projection routine 6667 again with focal length 180*SB_N on the
  * current inputs, and stores the result, scaled back, for the point the
@@ -466,7 +467,8 @@ void hires_breakpoint(Hires *h, Machine *m, CPU *c) {
                 /* the game builds its horizon from the projected point
                  * ([2304], [2306]) straight ahead; its precise position
                  * lets the horizon move smoothly (see hires_compose) */
-                HVert q = lookup(h, (int16_t)rw(mem, ds + 0x2304), (int16_t)rw(mem, ds + 0x2306));
+                it->refix = (int16_t)rw(mem, ds + 0x2304); it->refiy = (int16_t)rw(mem, ds + 0x2306);
+                HVert q = lookup(h, it->refix, it->refiy);
                 it->refx = q.x; it->refy = q.y;
                 it->col = 1;
                 /* with ground detail off ([233E] = 0, Alt+G) the ground is
@@ -755,7 +757,6 @@ static void fill_line(const Target *t, HVert a, HVert b, float half, SpanFn fn, 
 #define SHADE_N 768
 /* the exact horizon lies HZ_V above the renderer's first scanline (measured) */
 #define HZ_V 0.0f
-#define K_REF 1.375f
 static inline float map_v(const float *m, float x, float row) { return m[3] * x + m[4] * row + m[5]; }
 static inline float map_u(const float *m, float x, float row) { return m[0] * x + m[1] * row + m[2]; }
 static inline int ground_row(float v) {
@@ -784,6 +785,43 @@ static void span_sfill(const Target *t, int row, int x0, int x1, void *ctx) {
     const SFillCtx *p = ctx;
     uint16_t *d = p->buf + (size_t)row * t->w;
     for (int x = x0; x < x1; x++) d[x] = (uint16_t)(p->col + 1);
+}
+
+/* The top scanlines just below the horizon are filled the way the game
+ * does it: scanline k covers what the shapes cover at y = k + TOP_C, as a
+ * whole band (v from k + 1 to k + 2, see V_OFF), with the sides at the
+ * higher resolution. Far away the shapes are thin slivers; drawn exactly,
+ * they leave gaps that the game does not have (it fills them up to its
+ * horizon), and the haze below would show through as a blue band. */
+#define TOP_ROWS 3
+static float TOP_C = 1.0f;
+static void fill_rows(const Target *t, const HEdge *e, int n, SFillCtx *sc, int kmin, int kmax, float voff) {
+    float xs[64];
+    for (int k = kmin; k <= kmax; k++) {
+        float y = k + TOP_C;
+        int m = 0;
+        for (int i = 0; i < n && m < 64; i++) {
+            float y1 = e[i].y1, y2 = e[i].y2;
+            if ((y1 <= y && y < y2) || (y2 <= y && y < y1)) {
+                float x = e[i].x1 + (y - y1) * (e[i].x2 - e[i].x1) / (y2 - y1);
+                int j = m++;
+                while (j > 0 && xs[j - 1] > x) { xs[j] = xs[j - 1]; j--; }
+                xs[j] = x;
+            }
+        }
+        if (m < 2) continue;
+        float vlo = k + voff, vhi = vlo + 1.f;
+        int r0 = (int)ceilf((t->bot - vhi) * t->s - 0.5f), r1 = (int)ceilf((t->bot - vlo) * t->s - 0.5f);
+        if (r0 < 0) r0 = 0;
+        if (r1 > t->h) r1 = t->h;
+        for (int r = r0; r < r1; r++)
+            for (int i = 0; i + 1 < m; i += 2) {
+                float a = xs[i] * t->s - 0.5f, b = xs[i + 1] * t->s - 0.5f;
+                if (b < 0 || a >= t->w) continue;
+                int x0 = a < 0 ? 0 : (int)ceilf(a), x1 = b >= t->w ? t->w : (int)ceilf(b);
+                if (x1 > x0) span_sfill(t, r, x0, x1, sc);
+            }
+    }
 }
 
 /* The scanline renderer fills the ground in its own frame (u along a
@@ -826,7 +864,17 @@ static void draw_ground(Hires *h, const HFrame *f, const HItem *it, const Target
     }
     memset(h->sbuf, 0, need * sizeof *h->sbuf);
     Target ts = {NULL, sw, sh, s, sbot, NULL, NULL, NULL, 0, 0};
-    /* consecutive edges with the same polygon number form a polygon */
+    /* consecutive edges with the same polygon number form a polygon; pass 1
+     * fills them exactly, pass 2 redoes the top scanlines like the game */
+    int ktop = (int)it->vtop - 1;
+    for (int pass = 0; pass < 2; pass++) {
+    if (pass == 1) {
+        /* clear the band of the top scanlines: v >= ktop - TOP_ROWS + 1 + V_OFF - 0.5 */
+        float vlo = (ktop - TOP_ROWS + 1) + V_OFF - 0.5f + t->vshift;
+        int rend = (int)ceilf((sbot - vlo) * s - 0.5f);
+        if (rend > sh) rend = sh;
+        if (rend > 0) memset(h->sbuf, 0, (size_t)rend * sw * sizeof *h->sbuf);
+    }
     int a0 = 0;
     while (a0 < n) {
         int k = a0 + 1;
@@ -850,13 +898,18 @@ static void draw_ground(Hires *h, const HFrame *f, const HItem *it, const Target
                 pe[np] = *a; pe[np].x1 -= umin; pe[np].x2 -= umin;
                 /* the game cuts the shapes off just below its horizon, on
                  * whole scanlines: those corners move with the horizon */
-                if (a->iy1 >= it->vtop - 2) pe[np].y1 += t->vshift;
-                if (a->iy2 >= it->vtop - 2) pe[np].y2 += t->vshift;
+                if (pass == 0 && a->iy1 >= it->vtop - 2) pe[np].y1 += t->vshift;
+                if (pass == 0 && a->iy2 >= it->vtop - 2) pe[np].y2 += t->vshift;
                 np++;
             }
         }
-        if (np >= 2) { SFillCtx sc = {h->sbuf, e[a0].col}; fill_edges(&ts, pe, np, span_sfill, &sc); }
+        if (np >= 2) {
+            SFillCtx sc = {h->sbuf, e[a0].col};
+            if (pass == 0) fill_edges(&ts, pe, np, span_sfill, &sc);
+            else fill_rows(&ts, pe, np, &sc, ktop - TOP_ROWS + 1, ktop, V_OFF - 0.5f + t->vshift);
+        }
         a0 = k;
+    }
     }
     /* onto the screen */
     for (int r = 0; r < t->h; r++) {
@@ -1067,15 +1120,23 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
      * mapping and the renderer's pixels are known. */
     memset(h->bgk1, BG_GAME, (size_t)W * vh);
     float gvh = gvtop + HZ_V, gshift = 0;
-    /* upright, the horizon goes through the projected point straight ahead
-     * (K_REF scanlines below it, measured); the game rounds it to whole
-     * scanlines, so it jumps a pixel now and then. Use the precise one when
-     * it is within a pixel of the game's. */
+    /* upright, the game builds its horizon through the projected point
+     * straight ahead, rounded to whole pixels, so it jumps a pixel now and
+     * then. The precise point gives a smooth horizon, a fixed number of
+     * scanlines from the point; that number depends on the aircraft and
+     * view, so it is learned as the running mean of the game's own
+     * horizon. */
     for (int i = 0; i < f->ni; i++) {
         const HItem *gi = &f->items[i];
-        if (gi->type != IT_GROUND || gi->col || gi->orient > 1) continue;
-        float d = map_v(gi->m, gi->refx, f->bot - gi->refy) + K_REF - gi->vtop;
-        gshift = fabsf(d) <= 1.0f ? d : 0.f;
+        if (gi->type != IT_GROUND || gi->col || gi->orient > 1) { continue; }
+        float vref = map_v(gi->m, gi->refx, f->bot - gi->refy), k = gi->vtop - vref;
+        if (h->kref_serial != f->serial) {
+            if (!h->kref_n || fabsf(k - h->kref) > 2.f) { h->kref = k; h->kref_n = 0; }
+            h->kref += (k - h->kref) / (float)(h->kref_n < 30 ? ++h->kref_n : 30);
+            h->kref_serial = f->serial;
+        }
+        float d = vref + h->kref - gi->vtop;
+        gshift = fabsf(d) <= 1.5f ? d : 0.f;
     }
     gvh += gshift;
     int precise = gfound && f->gok && gbase >= 0;
