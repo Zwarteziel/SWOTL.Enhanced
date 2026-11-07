@@ -701,9 +701,13 @@ int cpu_run(CPU *c, int n) {
     int i;
     for (i = 0; i < n && !c->halted; i++) {
         c->inhibit_irq = 0;
-        if (c->watch_lin && ((uint32_t)c->s[CS] << 4) + c->ip == c->watch_lin) {
-            c->watch_hits++;
-            if (c->watch_hook) c->watch_hook(c->host, c);
+        if (c->watch_lin | c->ret_lin) {
+            uint32_t lin = ((uint32_t)c->s[CS] << 4) + c->ip;
+            if (lin == c->ret_lin && (c->ret_sp == 0xFFFF || c->r[SP] == c->ret_sp)) { c->ret_lin = 0; if (c->ret_hook) c->ret_hook(c->host, c); }
+            if (lin == c->watch_lin) {
+                c->watch_hits++;
+                if (c->watch_hook) c->watch_hook(c->host, c);
+            }
         }
         if (c->bp_cs && c->s[CS] == c->bp_cs && (c->bp_map[c->ip >> 3] >> (c->ip & 7) & 1)) c->bp_hook(c->host, c);
         step(c);

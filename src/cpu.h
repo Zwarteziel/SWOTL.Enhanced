@@ -51,6 +51,10 @@ struct CPU {
     uint32_t watch_lin;         /* linear address to count executions of */
     uint64_t watch_hits;
     void (*watch_hook)(void *host, CPU *c); /* called before that instruction */
+    /* one-shot: ret_hook is called when execution reaches linear address
+     * ret_lin with SP == ret_sp (the return from a call); 0 = off */
+    uint32_t ret_lin; uint16_t ret_sp;
+    void (*ret_hook)(void *host, CPU *c);
     /* breakpoints: bp_hook is called before any instruction in segment bp_cs
      * whose offset has its bit set in bp_map (8 KB). bp_cs = 0: none. */
     uint16_t bp_cs;

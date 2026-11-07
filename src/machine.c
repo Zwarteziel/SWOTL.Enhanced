@@ -637,6 +637,11 @@ static void on_present(void *host, CPU *c) {
     if (m->hires) hires_present(m->hires, m, c);
 }
 
+static void on_present_done(void *host, CPU *c) {
+    Machine *m = host;
+    if (m->hires) hires_present_done(m->hires, m, c);
+}
+
 static void on_breakpoint(void *host, CPU *c) {
     Machine *m = host;
     if (m->hires) hires_breakpoint(m->hires, m, c);
@@ -740,6 +745,7 @@ Machine *machine_create(const char *gamedir, const char *exe, const char *args) 
     cpu_reset(&m->cpu);
     m->cpu.watch_hook = on_present;
     m->cpu.bp_hook = on_breakpoint;
+    m->cpu.ret_hook = on_present_done;
     m->pic_imr = 0xB8; /* timer, keyboard, cascade, mouse unmasked */
     m->pit_rw[0] = 3; m->pit_mode[0] = 3;
     m->next_irq0_us = pit_period_us(m, 0);

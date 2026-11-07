@@ -26,6 +26,8 @@ int hires_scan(Hires *h, struct Machine *m, int in_3d);
 void hires_detach(Hires *h, struct Machine *m);
 /* Called by the machine at each frame present of the VGA driver. */
 void hires_present(Hires *h, struct Machine *m, CPU *c);
+/* Called when the present call returns. */
+void hires_present_done(Hires *h, struct Machine *m, CPU *c);
 /* Called by the CPU at a breakpoint. */
 void hires_breakpoint(Hires *h, struct Machine *m, CPU *c);
 

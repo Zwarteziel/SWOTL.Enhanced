@@ -82,6 +82,12 @@ struct Hires {
     uint16_t bufseg[2];  /* the two 3D buffers the game alternates between */
     uint8_t wmap[320 * VIEW_MAX]; /* CPU write tracking map */
     uint8_t vprev[320 * VIEW_MAX];   /* screen mask of the previous ready frame */
+    /* pixels of the screen the game's present routine writes: the 3D view
+     * (the cockpit is never written by it), collected over the frames */
+    uint8_t pwmap[320 * VIEW_MAX], vacc[320 * VIEW_MAX];
+    /* pixels where the screen has differed from the 3D frame (cockpit) */
+    uint8_t nonview[320 * VIEW_MAX];
+    int vacc_vh, pw_rows;
     uint16_t wseg; int wrows;
     /* the line or polygon being drawn: its region of the buffer before */
     int line_item, lx0, lx1, ly0, ly1; uint16_t lseg; int lrows;
@@ -443,6 +449,17 @@ void hires_present(Hires *h, Machine *m, CPU *c) {
     int vh = h->ds ? (int16_t)rw(m->mem, ds + 0x2591) : 0;
     int bot = h->ds ? (int16_t)rw(m->mem, ds + 0x2593) : 0;
     int vw = h->ds ? (int16_t)rw(m->mem, ds + 0x2583) : 0;
+    /* watch which screen pixels this present call writes */
+    if (vw != 320 || vh != h->vacc_vh) { memset(h->vacc, 0, sizeof h->vacc); memset(h->nonview, 0, sizeof h->nonview); h->vacc_vh = vh; }
+    h->pw_rows = 0;
+    if (h->found > 0 && vw == 320 && vh > 8 && vh <= VIEW_MAX && !c->wt_len) {
+        uint32_t sp = ss + c->r[SP];
+        memset(h->pwmap, 0, 320u * vh);
+        c->wt_map = h->pwmap; c->wt_lo = 0xA0000; c->wt_len = 320u * vh;
+        c->ret_lin = ((uint32_t)rw(m->mem, sp + 2) << 4) + rw(m->mem, sp);
+        c->ret_sp = 0xFFFF;
+        h->pw_rows = vh;
+    }
     /* The game copies a frame to the screen during its present call, so at
      * the next present the previous frame is completely on the screen: only
      * then it is used, with the mask of where the screen shows it. Using a
@@ -452,7 +469,10 @@ void hires_present(Hires *h, Machine *m, CPU *c) {
         const uint8_t *vram = m->mem + 0xA0000;
         if (h->ready >= 0) memcpy(h->vprev, h->fr[h->ready].vmask, sizeof h->vprev);
         else memset(h->vprev, 0, sizeof h->vprev);
-        for (int i = 0; i < 320 * p->vh; i++) p->vmask[i] = vram[i] == p->buf[i];
+        for (int i = 0; i < 320 * p->vh; i++) {
+            p->vmask[i] = vram[i] == p->buf[i];
+            if (!p->vmask[i]) h->nonview[i] = 1;
+        }
         if (dbg_on()) {
             int a1 = 0, a2 = 0, a3 = 0;
             const uint8_t *cur = m->mem + ((uint32_t)seg << 4);
@@ -484,6 +504,16 @@ void hires_present(Hires *h, Machine *m, CPU *c) {
     h->pass_start = 0;
     h->pending_poly = h->pending_line = -1;
     h->gen++;
+}
+
+void hires_present_done(Hires *h, Machine *m, CPU *c) {
+    (void)m;
+    if (!h->pw_rows || c->wt_map != h->pwmap) return;
+    c->wt_len = 0;
+    int n = 0;
+    for (int i = 0; i < 320 * h->pw_rows; i++) if (h->pwmap[i]) { h->vacc[i] = 1; n++; }
+    if (dbg_on()) fprintf(stderr, "[hires] present wrote %d pixels\n", n);
+    h->pw_rows = 0;
 }
 
 void hires_debug(Hires *h, Machine *m, FILE *out) {
@@ -723,6 +753,8 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
                     int yy = r + dy, xx = x + dx;
                     if (yy >= 0 && yy < vh && xx >= 0 && xx < W && h->kind1[yy * W + xx]) cov = 1;
                 }
+            /* pixels a line or object routine drew are not background */
+            if (f->lmask[i] && src[i] == f->lval[i]) cov = 1;
             h->other1[i] = (uint8_t)cov; /* temporarily: covered mask */
         }
         for (int x = 0; x < W; x++) {
@@ -823,7 +855,10 @@ screen:;
             uint8_t v = vram[y * W + x];
             uint32_t *o = out + (size_t)y * n * HW + (size_t)x * n;
             int i3 = y * W + x;
-            if (y < vh && (f->vmask[i3] || h->vprev[i3]) && (v == src[i3] || v == nxt[i3])) {
+            /* part of the 3D view: written by the game's present routine at
+             * some time, or never seen different from the 3D frame */
+            int view = h->vacc[i3] || (!h->nonview[i3] && f->vmask[i3]);
+            if (y < vh && view && (v == src[i3] || v == nxt[i3])) {
                 for (int yy = 0; yy < n; yy++) {
                     const uint8_t *hi = h->hidx + (size_t)(y * n + yy) * HW + x * n;
                     uint32_t *oo = o + (size_t)yy * HW;
