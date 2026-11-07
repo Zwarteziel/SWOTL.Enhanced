@@ -37,7 +37,7 @@ typedef struct { float x1, y1, x2, y2; int32_t ix1, iy1, ix2, iy2; uint16_t ord;
  * pointing down) to the renderer's frame: u = m0*x + m1*row + m2 (along a
  * scanline), v = m3*x + m4*row + m5 (the scanline, y up). vtop: its first
  * scanline, just below the horizon. col = 1: no mapping (left as drawn). */
-typedef struct { uint8_t type, col, orient; uint16_t n; uint32_t first; float t0, t1; float m[6], vtop; } HItem;
+typedef struct { uint8_t type, col, orient; uint16_t n; uint32_t first; float t0, t1; float m[6], vtop, refx, refy; } HItem;
 typedef struct { float x, y; } HVert;
 
 typedef struct {
@@ -336,7 +336,8 @@ static void region_end(Hires *h, Machine *m, uint32_t ds, HFrame *f) {
     float bot = (int16_t)rw(m->mem, ds + 0x2593) + 1.5f;
     float dx = b->x - a->x, dy = b->y - a->y, l2 = dx * dx + dy * dy;
     if (l2 < 1e-6f) l2 = 1e-6f;
-    if (tracked && h->lx0 <= h->lx1 && h->ly0 <= h->ly1) {
+    /* a shape that is not redrawn (not confirmed) stays as the game drew it */
+    if (tracked && it->col != 0xFF && h->lx0 <= h->lx1 && h->ly0 <= h->ly1) {
         const uint8_t *buf = m->mem + ((uint32_t)h->lseg << 4);
         for (int y = h->ly0; y <= h->ly1; y++)
             for (int x = h->lx0; x <= h->lx1; x++) {
@@ -462,6 +463,11 @@ void hires_breakpoint(Hires *h, Machine *m, CPU *c) {
                 it->first = (uint32_t)h->pass_start; it->n = (uint16_t)(f->ne - h->pass_start);
                 it->orient = (uint8_t)(rw(mem, ds + 0x25D0) & 7);
                 it->vtop = (int16_t)rw(mem, ds + 0x2338);
+                /* the game builds its horizon from the projected point
+                 * ([2304], [2306]) straight ahead; its precise position
+                 * lets the horizon move smoothly (see hires_compose) */
+                HVert q = lookup(h, (int16_t)rw(mem, ds + 0x2304), (int16_t)rw(mem, ds + 0x2306));
+                it->refx = q.x; it->refy = q.y;
                 it->col = 1;
                 /* with ground detail off ([233E] = 0, Alt+G) the ground is
                  * drawn plainly, without this frame: left as drawn */
@@ -681,6 +687,8 @@ typedef struct {
      * ends exactly at scanline vh (mapping gm) instead of at the game's
      * pixels */
     const uint8_t *bgk; const float *gm; float vh;
+    /* sub-pixel shift of the horizon and of what the game ties to it */
+    float vshift;
 } Target;
 
 enum { BG_GAME, BG_GROUND, BG_HORIZON };
@@ -747,6 +755,7 @@ static void fill_line(const Target *t, HVert a, HVert b, float half, SpanFn fn, 
 #define SHADE_N 768
 /* the exact horizon lies HZ_V above the renderer's first scanline (measured) */
 #define HZ_V 0.0f
+#define K_REF 1.375f
 static inline float map_v(const float *m, float x, float row) { return m[3] * x + m[4] * row + m[5]; }
 static inline float map_u(const float *m, float x, float row) { return m[0] * x + m[1] * row + m[2]; }
 static inline int ground_row(float v) {
@@ -816,7 +825,7 @@ static void draw_ground(Hires *h, const HFrame *f, const HItem *it, const Target
         h->sbuf_size = need;
     }
     memset(h->sbuf, 0, need * sizeof *h->sbuf);
-    Target ts = {NULL, sw, sh, s, sbot, NULL, NULL, NULL, 0};
+    Target ts = {NULL, sw, sh, s, sbot, NULL, NULL, NULL, 0, 0};
     /* consecutive edges with the same polygon number form a polygon */
     int a0 = 0;
     while (a0 < n) {
@@ -837,7 +846,14 @@ static void draw_ground(Hires *h, const HFrame *f, const HItem *it, const Target
                 if ((a->ix1 == b->ix1 && a->iy1 == b->iy1 && a->ix2 == b->ix2 && a->iy2 == b->iy2) ||
                     (a->ix1 == b->ix2 && a->iy1 == b->iy2 && a->ix2 == b->ix1 && a->iy2 == b->iy1)) { gone[i] = gone[j] = 1; break; }
             }
-            if (!gone[i]) { pe[np] = *a; pe[np].x1 -= umin; pe[np].x2 -= umin; np++; }
+            if (!gone[i]) {
+                pe[np] = *a; pe[np].x1 -= umin; pe[np].x2 -= umin;
+                /* the game cuts the shapes off just below its horizon, on
+                 * whole scanlines: those corners move with the horizon */
+                if (a->iy1 >= it->vtop - 2) pe[np].y1 += t->vshift;
+                if (a->iy2 >= it->vtop - 2) pe[np].y2 += t->vshift;
+                np++;
+            }
         }
         if (np >= 2) { SFillCtx sc = {h->sbuf, e[a0].col}; fill_edges(&ts, pe, np, span_sfill, &sc); }
         a0 = k;
@@ -856,7 +872,7 @@ static void draw_ground(Hires *h, const HFrame *f, const HItem *it, const Target
             if (t->bgk && t->bgk[gi] == BG_HORIZON) { if (map_v(t->gm, X, R) >= t->vh) continue; }
             else if (t->gmask && !t->gmask[gi]) continue;
             if (mark) { h->kind1[gi] = 1; h->base1[gi] = col; }
-            else t->dst[(size_t)r * t->w + x] = shade ? (uint8_t)(col + shade[ground_row(v)]) : col;
+            else t->dst[(size_t)r * t->w + x] = shade ? (uint8_t)(col + shade[ground_row(v - t->vshift)]) : col;
         }
     }
 }
@@ -918,7 +934,7 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
     memset(h->skip, 0, sizeof h->skip);
 
     /* 1. coverage at the game's resolution */
-    Target t1 = {NULL, W, vh, 1, f->bot, f->gmask, NULL, NULL, 0};
+    Target t1 = {NULL, W, vh, 1, f->bot, f->gmask, NULL, NULL, 0, 0};
     memset(h->kind1, 0, (size_t)W * vh);
     draw_items(h, f, &t1, 1, NULL);
 
@@ -1050,7 +1066,18 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
      * exact horizon line instead of at the game's pixels. Only when the
      * mapping and the renderer's pixels are known. */
     memset(h->bgk1, BG_GAME, (size_t)W * vh);
-    float gvh = gvtop + HZ_V;
+    float gvh = gvtop + HZ_V, gshift = 0;
+    /* upright, the horizon goes through the projected point straight ahead
+     * (K_REF scanlines below it, measured); the game rounds it to whole
+     * scanlines, so it jumps a pixel now and then. Use the precise one when
+     * it is within a pixel of the game's. */
+    for (int i = 0; i < f->ni; i++) {
+        const HItem *gi = &f->items[i];
+        if (gi->type != IT_GROUND || gi->col || gi->orient > 1) continue;
+        float d = map_v(gi->m, gi->refx, f->bot - gi->refy) + K_REF - gi->vtop;
+        gshift = fabsf(d) <= 1.0f ? d : 0.f;
+    }
+    gvh += gshift;
     int precise = gfound && f->gok && gbase >= 0;
     if (precise) {
         /* near[]: within 3 pixels of a redrawn ground shape (sky1 as scratch) */
@@ -1067,16 +1094,16 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
                 for (int dy = -3; dy <= 3 && !v; dy++) { int yy = r + dy; if (yy >= 0 && yy < vh && rowmax[yy * W + x]) v = 1; }
                 near[r * W + x] = (uint8_t)v;
             }
-        float band = 0.5f * (fabsf(gm[3]) + fabsf(gm[4])) + 0.75f;
+        float band = 0.5f * (fabsf(gm[3]) + fabsf(gm[4])) + 1.5f;
         for (int r = 0; r < vh; r++)
             for (int x = 0; x < W; x++) {
                 int i = r * W + x;
                 float v = map_v(gm, x + 0.5f, r + 0.5f), d = v - gvh;
-                int gr = ground_row(v), bare = BARE(gr);
+                int bare = BARE(ground_row(v - gshift)), bare1 = BARE(ground_row(v));
                 if (fabsf(d) < band) {
                     h->bgk1[i] = BG_HORIZON;
                     if (d < 0) h->bg1[i] = (uint8_t)bare;
-                } else if (f->gmask[i] && src[i] == f->gval[i] && (near[i] || src[i] == bare)) {
+                } else if (f->gmask[i] && src[i] == f->gval[i] && (near[i] || src[i] == bare1)) {
                     h->bgk1[i] = BG_GROUND;
                     h->bg1[i] = (uint8_t)bare;
                 }
@@ -1121,7 +1148,13 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
                 }
             /* still showing what the ground, line or polygon routine drew */
             if (f->lmask[i] && src[i] == f->lval[i]) oth = 0;
-            if (f->gok && f->gmask[i] && src[i] == f->gval[i]) oth = 0;
+            else if (f->gok && f->gmask[i]) {
+                /* the ground renderer drew here, and something we do not
+                 * redraw (an aircraft, smoke) has drawn over it since: keep
+                 * that, whatever its colour */
+                if (src[i] == f->gval[i]) oth = 0;
+                else oth = 1;
+            }
             h->other1[i] = (uint8_t)oth;
         }
 
@@ -1142,11 +1175,11 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
             for (int xx = 0; xx < n; xx++) {
                 float X = (x * n + xx + 0.5f) / n, v = map_v(gm, X, R);
                 int ground = k[x] == BG_GROUND || v < gvh;
-                d[x * n + xx] = ground ? (uint8_t)BARE(ground_row(v)) : sk[x];
+                d[x * n + xx] = ground ? (uint8_t)BARE(ground_row(v - gshift)) : sk[x];
             }
         }
     }
-    Target tn = {h->hidx, HW, HH, n, f->bot, f->gmask, precise ? h->bgk1 : NULL, gm, gvh};
+    Target tn = {h->hidx, HW, HH, n, f->bot, f->gmask, precise ? h->bgk1 : NULL, gm, gvh, precise ? gshift : 0.f};
     draw_items(h, f, &tn, 0, shade);
     for (int r = 0; r < vh; r++)
         for (int x = 0; x < W; x++)
