@@ -89,6 +89,7 @@ struct Hires {
     uint16_t wtag[320 * VIEW_MAX]; /* scanline of each pixel the ground renderer wrote */
     int gitem;           /* ground item being rendered, -1 = none */
     float kref; int kref_n; uint64_t kref_serial; /* horizon below the point ahead */
+    float hz_last; int hz_ok; /* the horizon last used (hysteresis) */
     uint8_t vprev[320 * VIEW_MAX];   /* screen mask of the previous ready frame */
     /* pixels of the screen the game's present routine writes: the 3D view
      * (the cockpit is never written by it), collected over the frames */
@@ -218,7 +219,11 @@ static HVert lookup(Hires *h, int32_t x, int32_t y) {
     return (HVert){(float)x, (float)y + 0.5f};
 }
 
-#define SB_N 16
+/* 64: the precise points are known to 1/64 pixel. With 16 a line moving
+ * slowly sideways went a little back and forth along a slight slope (one end
+ * a 1/16 step up, the motion down), which made its steps flicker. 128 is too
+ * much for the routine's 16-bit arithmetic. */
+#define SB_N 64
 
 /* Runs the projection routine 6667 again with focal length 180*SB_N on the
  * current inputs, and stores the result, scaled back, for the point the
@@ -294,9 +299,13 @@ static void rerun_projection(Hires *h, Machine *m, CPU *c) {
     /* when the long route takes [22F0] as it is (6806), the game's y is one
      * less (measured) */
     if (fpath) fy -= 1.0;
-    /* safety net: a rare edge case of the long route differs by a pixel */
-    if (fabs(fx - x1) > 1.2) fx = x1;
-    if (fabs(fy - y1) > 1.6) fy = y1 + 0.5;
+    /* safety net against a failed rerun. The game's own value is rounded
+     * more than once (and turned with the bank), so in a bank it lies up to
+     * about 1.8 pixels from the precise one; a smaller limit would snap
+     * such points to the game's value now and then, and they would
+     * tremble. */
+    if (fabs(fx - x1) > 2.5) fx = x1;
+    if (fabs(fy - y1) > 2.5) fy = y1 + 0.5;
     hash_put(h, x1, y1, (float)fx, (float)fy);
 }
 
@@ -1151,6 +1160,13 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
             h->kref_serial = f->serial;
         }
         float d = vref + h->kref - gi->vtop;
+        /* the precise point is known to 1/64 pixel and the game moves it a
+         * little back and forth from frame to frame; such small changes
+         * would make the shading bands along the horizon flicker, so the
+         * horizon only follows changes of more than 1/20 pixel */
+        float hz = gi->vtop + d;
+        if (h->hz_ok && fabsf(hz - h->hz_last) < 0.05f && fabsf(h->hz_last - gi->vtop) <= 1.5f) d = h->hz_last - gi->vtop;
+        else { h->hz_last = hz; h->hz_ok = 1; }
         gshift = fabsf(d) <= 1.5f ? d : 0.f;
     }
     gvh += gshift;

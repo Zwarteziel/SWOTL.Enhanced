@@ -1,6 +1,6 @@
 # SWOTL Enhanced
 
-Version 0.1.26
+Version 0.1.27
 
 Run **Secret Weapons of the Luftwaffe** (Lucasfilm Games, 1991) on modern Windows
 without installing DOSBox. You need your own copy of the original game files.
@@ -162,7 +162,7 @@ How it works: the game still draws its own picture at 320x200. SWOTL Enhanced
 watches the routines that draw the ground polygons, roads and buildings, and
 draws the same shapes again at the higher resolution. Each corner point is
 computed a second time, with more precision, by running the game's own
-projection routine again on the side with a sixteen times larger focal length.
+projection routine again on the side with a 64 times larger focal length.
 Anything it does not recognise is taken from the game's own picture.
 
 Limits of this first version:
