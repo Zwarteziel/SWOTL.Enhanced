@@ -77,7 +77,7 @@ struct Hires {
     int pending_line;    /* item index of a line waiting for its colour */
     HSlot hash[HASH_SIZE];
     uint32_t gen;
-    uint8_t save_vars[0x600], save_stack[512], save_code[12];
+    uint8_t save_vars[0x600], save_stack[512], save_code[18];
     uint64_t serial;
     /* compose scratch; hidx holds the redrawn view of frame hidx_serial */
     uint8_t *hidx; size_t hidx_size;
@@ -238,12 +238,18 @@ static void rerun_projection(Hires *h, Machine *m, CPU *c) {
     memcpy(h->save_stack, mem + sp0, sizeof h->save_stack);
     memcpy(h->save_code, mem + cs + 0x6667, 6);
     memcpy(h->save_code + 6, mem + cs + 0x669B, 6);
+    memcpy(h->save_code + 12, mem + cs + 0x67CC, 3);
+    memcpy(h->save_code + 15, mem + cs + 0x6811, 3);
 
     double cx = (int16_t)rw(mem, ds + 0x2587) + (int16_t)rw(mem, ds + 0x2310);
     double cy = -(double)(int16_t)rw(mem, ds + 0x2314) + (int16_t)rw(mem, ds + 0x2595) + (int16_t)rw(mem, ds + 0x2312);
     /* focal length and range limits */
     ww(mem, cs + 0x6667 + 4, 180 * N);
     ww(mem, cs + 0x669B + 4, 180 * N);
+    /* the long route subtracts and adds a one (67CC: sub bx,1; 6811: add
+     * ax,1); scale those too, so the result is the game's own geometry */
+    if (mem[cs + 0x67CC] == 0x83 && mem[cs + 0x67CD] == 0xEB && mem[cs + 0x67CE] == 0x01) mem[cs + 0x67CE] = (uint8_t)N;
+    if (mem[cs + 0x6811] == 0x05 && mem[cs + 0x6812] == 0x01 && mem[cs + 0x6813] == 0x00) ww(mem, cs + 0x6812, (uint16_t)N);
     uint32_t l8f = (uint32_t)rw(mem, ds + 0x258F) * N, l99 = (uint32_t)rw(mem, ds + 0x2599) * N;
     ww(mem, ds + 0x258F, (uint16_t)(l8f > 0xFFFF ? 0xFFFF : l8f));
     ww(mem, ds + 0x2599, (uint16_t)(l99 > 0x7FFF ? 0x7FFF : l99));
@@ -259,13 +265,19 @@ static void rerun_projection(Hires *h, Machine *m, CPU *c) {
     ww(mem, ss + c->r[SP], ip);
     c->ip = 0x6667;
     int n = 0;
-    while (n < 20000 && !(c->ip == ip && c->r[SP] == save.r[SP] && c->s[CS] == save.s[CS])) { cpu_step(c); n++; }
+    int fpath = 0;
+    while (n < 20000 && !(c->ip == ip && c->r[SP] == save.r[SP] && c->s[CS] == save.s[CS])) {
+        cpu_step(c); n++;
+        if (c->ip == 0x6806) fpath = 1;
+    }
     int32_t xn = rd32(mem, ds + 0x22DE), yn = rd32(mem, ds + 0x22E2);
 
     memcpy(mem + ds + 0x2200, h->save_vars, sizeof h->save_vars);
     memcpy(mem + sp0, h->save_stack, sizeof h->save_stack);
     memcpy(mem + cs + 0x6667, h->save_code, 6);
     memcpy(mem + cs + 0x669B, h->save_code + 6, 6);
+    memcpy(mem + cs + 0x67CC, h->save_code + 12, 3);
+    memcpy(mem + cs + 0x6811, h->save_code + 15, 3);
     *c = save;
     if (n >= 20000) return;
 
@@ -279,18 +291,9 @@ static void rerun_projection(Hires *h, Machine *m, CPU *c) {
         double gx = (xn - cxs[i]) / N + cxs[i];
         if (fabs(gx - x1) < fabs(fx - x1)) fx = gx;
     }
-    /* The long route (6811) computes y = [22F0] - ([22EC] - y' + 1) * [25CE]
-     * / 32768 with y' one less than the projected value: those two unscaled
-     * ones make the scaled-back y 2 * (N - 1) / N * [25CE] / 32768 too
-     * high. Take whichever of the two fits the game's own value. */
-    {
-        double k = rw(mem, ds + 0x25CE) / 32768.0, gy = fy - 2.0 * k * (N - 1) / N;
-        if (fabs(gy - (y1 + 0.5)) < fabs(fy - (y1 + 0.5))) fy = gy;
-        /* and its x comes out 2 * (N - 1) / N too low (measured). The game's
-         * x is about the precise one rounded */
-        double gx = fx + 2.0 * (N - 1) / N;
-        if (fabs(gx - x1) < fabs(fx - x1)) fx = gx;
-    }
+    /* when the long route takes [22F0] as it is (6806), the game's y is one
+     * less (measured) */
+    if (fpath) fy -= 1.0;
     /* safety net: a rare edge case of the long route differs by a pixel */
     if (fabs(fx - x1) > 1.2) fx = x1;
     if (fabs(fy - y1) > 1.6) fy = y1 + 0.5;
