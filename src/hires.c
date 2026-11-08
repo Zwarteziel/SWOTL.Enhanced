@@ -277,7 +277,19 @@ static void rerun_projection(Hires *h, Machine *m, CPU *c) {
     double fx = (xn - cx) / N + cx, fy = (yn - cy) / N + cy;
     for (int i = 1; i < 3; i++) {
         double gx = (xn - cxs[i]) / N + cxs[i];
-        if (fabs(gx - (x1 + 0.5)) < fabs(fx - (x1 + 0.5))) fx = gx;
+        if (fabs(gx - x1) < fabs(fx - x1)) fx = gx;
+    }
+    /* The long route (6811) computes y = [22F0] - ([22EC] - y' + 1) * [25CE]
+     * / 32768 with y' one less than the projected value: those two unscaled
+     * ones make the scaled-back y 2 * (N - 1) / N * [25CE] / 32768 too
+     * high. Take whichever of the two fits the game's own value. */
+    {
+        double k = rw(mem, ds + 0x25CE) / 32768.0, gy = fy - 2.0 * k * (N - 1) / N;
+        if (fabs(gy - (y1 + 0.5)) < fabs(fy - (y1 + 0.5))) fy = gy;
+        /* and its x comes out 2 * (N - 1) / N too low (measured). The game's
+         * x is about the precise one rounded */
+        double gx = fx + 2.0 * (N - 1) / N;
+        if (fabs(gx - x1) < fabs(fx - x1)) fx = gx;
     }
     /* safety net: a rare edge case of the long route differs by a pixel */
     if (fabs(fx - x1) > 1.2) fx = x1;
