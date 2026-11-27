@@ -6,6 +6,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <math.h>
+#include <time.h>
 
 #define PIT_HZ 1193182.0
 #define VGA_FRAME_US 14268.0   /* 70.086 Hz */
@@ -727,8 +728,12 @@ void vga_set_mode(Machine *m, int mode, int clear) {
     machine_logf(m, 1, "set video mode %02X\n", mode);
 }
 
+double machine_clock(Machine *m) { return m->clock_base + now_us(m) / 1e6; }
+
 Machine *machine_create(const char *gamedir, const char *exe, const char *args) {
     Machine *m = calloc(1, sizeof *m);
+    m->clock_base = (double)time(NULL);
+    if (getenv("SWOTL_CLOCK")) m->clock_base = atof(getenv("SWOTL_CLOCK"));
     m->mem = calloc(1, MEM_SIZE);
     m->vram = calloc(4, 65536);
     snprintf(m->gamedir, sizeof m->gamedir, "%s", gamedir);

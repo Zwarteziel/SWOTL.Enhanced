@@ -1,6 +1,6 @@
 # SWOTL Enhanced
 
-Version 0.1.27
+Version 0.1.28
 
 Run **Secret Weapons of the Luftwaffe** (Lucasfilm Games, 1991) on modern Windows
 without installing DOSBox. You need your own copy of the original game files.
@@ -27,6 +27,10 @@ joystick and mouse. SDL3 handles the window, scaling, sound and gamepads.
 - **Speed.** The title bar shows the game's speed (`speed`): emulated time
   against real time. At 100% the game runs exactly as fast as on a real PC. If your PC cannot
   keep up, it drops below 100% and everything gets slower, the flying too.
+- **One clock.** The time of day the game sees (DOS and BIOS) comes from the
+  emulator's clock, started at the real time when the program starts. It runs
+  at the emulated speed, so everything the game times itself follows the
+  emulation, and seconds and hundredths always fit together.
 - **Frame rate.** The emulated CPU speed adapts to your PC. The title bar shows
   the real 3D frame rate (`fps`; a dash outside the 3D view). It counts the game's own frame-present calls in the VGA
   driver. At 10 MIPS it is about 16 fps, at 20 MIPS about 34 fps and at 40 MIPS
@@ -208,7 +212,9 @@ Limits of this first version:
 
 The release build is cross-compiled on Linux with clang, lld, mingw-w64 (built
 from source) and a static SDL3 3.2. See `build.sh`. The `tools/` folder has a
-headless test runner and a test harness for the CPU core. The CPU core passes
+headless test runner and a test harness for the CPU core. Set the environment
+variable `SWOTL_CLOCK` (seconds since 1970) to start the game's clock at a
+fixed time, so that test runs repeat exactly. The CPU core passes
 the SingleStepTests 8088 suite, apart from deliberate 286-style behaviour.
 
 ## Licences

@@ -21,6 +21,9 @@ typedef struct Machine {
 
     /* time (virtual, microseconds) */
     double time_us;
+    /* the one clock the DOS program sees: real time (seconds since 1970) when
+     * the emulated clock started, plus the emulated time; see machine_clock */
+    double clock_base;
     double ips;              /* instructions per microsecond */
     double slice_t0;         /* time at start of the current CPU slice */
     uint64_t slice_ic0;
@@ -120,6 +123,12 @@ typedef struct Machine {
 } Machine;
 
 Machine *machine_create(const char *gamedir, const char *exe, const char *args);
+/* The time of day the DOS program sees, in seconds since 1970: the emulator's
+ * clock, started at the real time when the machine was created (or at
+ * SWOTL_CLOCK, for repeatable tests). It runs at the emulated speed, so
+ * everything the game times with it scales with the emulation, and seconds
+ * and hundredths always come from the same clock. */
+double machine_clock(Machine *m);
 void machine_destroy(Machine *m);
 /* run for 'us' microseconds of emulated time */
 void machine_run(Machine *m, double us);

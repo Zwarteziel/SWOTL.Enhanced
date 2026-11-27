@@ -645,15 +645,19 @@ static void int21(Machine *m) {
         machine_logf(m, 1, "set vector %02X -> %04X:%04X\n", AL, c->s[DS], R(DX));
         break;
     case 0x2A: {
-        time_t t = time(NULL); struct tm *tm = localtime(&t);
+        time_t t = (time_t)machine_clock(m); struct tm *tm = localtime(&t);
         R(CX) = (uint16_t)(tm->tm_year + 1900); setDH(c, (uint8_t)(tm->tm_mon + 1)); setDL(c, (uint8_t)tm->tm_mday); setAL(c, (uint8_t)tm->tm_wday);
         break;
     }
     case 0x2B: case 0x2D: setAL(c, 0); break;
     case 0x2C: {
-        time_t t = time(NULL); struct tm *tm = localtime(&t);
+        /* the time of day follows the emulated clock (started at the real time
+         * of day), so that a program that times itself with it sees the seconds
+         * and the hundredths move together, as on a real PC */
+        double now = machine_clock(m);
+        time_t t = (time_t)now; struct tm *tm = localtime(&t);
         setCH(c, (uint8_t)tm->tm_hour); setCL(c, (uint8_t)tm->tm_min); setDH(c, (uint8_t)tm->tm_sec);
-        setDL(c, (uint8_t)((uint64_t)(m->time_us / 10000) % 100));
+        setDL(c, (uint8_t)((uint64_t)((now - (double)t) * 100.0) % 100));
         break;
     }
     case 0x2F: c->s[ES] = m->dta_seg; R(BX) = m->dta_off; break;
@@ -931,7 +935,7 @@ static void int1a(Machine *m) {
     case 0x00: R(CX) = rd16(m, 0x40, 0x6E); R(DX) = rd16(m, 0x40, 0x6C); setAL(c, rd8(m, 0x40, 0x70)); wr8(m, 0x40, 0x70, 0); break;
     case 0x01: wr16(m, 0x40, 0x6E, R(CX)); wr16(m, 0x40, 0x6C, R(DX)); break;
     case 0x02: case 0x04: {
-        time_t t = time(NULL); struct tm *tm = localtime(&t);
+        time_t t = (time_t)machine_clock(m); struct tm *tm = localtime(&t);
 #define BCD(x) (uint8_t)((((x) / 10) << 4) | ((x) % 10))
         if (AHr == 2) { setCH(c, BCD(tm->tm_hour)); setCL(c, BCD(tm->tm_min)); setDH(c, BCD(tm->tm_sec)); setDL(c, 0); }
         else { setCH(c, BCD((tm->tm_year + 1900) / 100)); setCL(c, BCD(tm->tm_year % 100)); setDH(c, BCD(tm->tm_mon + 1)); setDL(c, BCD(tm->tm_mday)); }
@@ -1008,6 +1012,14 @@ void hle_init(Machine *m) {
     /* BIOS data area */
     wr16(m, 0x40, 0x10, 0x0063 | 0x0020); /* 1 floppy, mouse, 80x25 colour */
     wr16(m, 0x40, 0x13, 640);
+    {   /* the BIOS tick count starts at the time of day, like on a real PC; from
+         * then on only the emulated timer interrupt advances it */
+        time_t t = (time_t)machine_clock(m); struct tm *tm = localtime(&t);
+        double sec = tm->tm_hour * 3600.0 + tm->tm_min * 60.0 + tm->tm_sec + (machine_clock(m) - (double)t);
+        uint32_t ticks = (uint32_t)(sec * 1193182.0 / 65536.0);
+        if (ticks >= 0x1800B0) ticks = 0x1800AF;
+        wr16(m, 0x40, 0x6C, (uint16_t)ticks); wr16(m, 0x40, 0x6E, (uint16_t)(ticks >> 16));
+    }
     wr16(m, 0x40, 0x1A, 0x1E); wr16(m, 0x40, 0x1C, 0x1E);
     wr16(m, 0x40, 0x80, 0x1E); wr16(m, 0x40, 0x82, 0x3E);
     wr8(m, 0x40, 0x49, 3); wr16(m, 0x40, 0x4A, 80);
