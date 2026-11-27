@@ -659,6 +659,8 @@ void machine_set_hires(Machine *m, int on) {
     }
 }
 
+void machine_set_hires_sources(Machine *m, int on) { m->hires_sources = on; }
+
 int machine_render_hires(Machine *m, int n, uint32_t *out) {
     return m->hires ? hires_compose(m->hires, m, n, out) : 0;
 }

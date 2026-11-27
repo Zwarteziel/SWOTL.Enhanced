@@ -92,6 +92,7 @@ int main(int argc, char **argv) {
             if (!strcmp(e->cmd, "shot")) shot(m, e->arg);
             else if (!strcmp(e->cmd, "hires")) machine_set_hires(m, atoi(e->arg));
             else if (!strcmp(e->cmd, "hshot")) hshot(m, e->arg);
+            else if (!strcmp(e->cmd, "hsrc")) machine_set_hires_sources(m, atoi(e->arg));
             else if (!strcmp(e->cmd, "fps")) {
                 /* sample the framebuffer every 2 ms for N ms and count changes */
                 double dur = atof(e->arg); uint32_t last = 0; int changes = 0; uint32_t b0 = m->cpu.vram_blits, by0 = m->cpu.vram_bytes;

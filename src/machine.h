@@ -120,6 +120,7 @@ typedef struct Machine {
 
     /* experimental high-resolution 3D view (NULL = off) */
     struct Hires *hires;
+    int hires_sources;       /* source view of the high-resolution 3D view (Ctrl+F3) */
 } Machine;
 
 Machine *machine_create(const char *gamedir, const char *exe, const char *args);
@@ -160,6 +161,9 @@ void machine_set_hires(Machine *m, int on);
 /* Draws the screen at 320*n x 200*n into out when the 3D view can be redrawn
  * at that resolution; returns 0 otherwise (use machine_render). */
 int machine_render_hires(Machine *m, int n, uint32_t *out);
+/* Source view: tints every pixel of the high-resolution 3D view by where it
+ * comes from (debugging). Not saved. */
+void machine_set_hires_sources(Machine *m, int on);
 /* "" when working or off, otherwise a short reason */
 const char *machine_hires_state(Machine *m);
 

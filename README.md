@@ -1,6 +1,6 @@
 # SWOTL Enhanced
 
-Version 0.1.28
+Version 0.1.29
 
 Run **Secret Weapons of the Luftwaffe** (Lucasfilm Games, 1991) on modern Windows
 without installing DOSBox. You need your own copy of the original game files.
@@ -80,6 +80,7 @@ comments in the file are not carried over.
 | Ctrl+F9 | Show speed, frame rate and CPU speed in the picture (they are always in the title bar) |
 | Ctrl+F6 | CRT shader on/off (saved in the ini file) |
 | Ctrl+F4 | High-resolution 3D view on/off (experimental, saved in the ini file) |
+| Ctrl+F3 | Source view of the high-resolution 3D view on/off (for testing; see below) |
 | Ctrl+F7 / Ctrl+F8 | Make the gamepad stick less / more curved (saved in the ini file) |
 | Ctrl+F5 | Start / stop a diagnostic recording (`swotl-rec-NNNN.avi` + `.log`, max 60 s) |
 
@@ -168,6 +169,20 @@ draws the same shapes again at the higher resolution. Each corner point is
 computed a second time, with more precision, by running the game's own
 projection routine again on the side with a 64 times larger focal length.
 Anything it does not recognise is taken from the game's own picture.
+
+**Source view (Ctrl+F3).** For finding the cause of flicker. Every pixel of the
+high-resolution view gets half the colour of where it comes from:
+
+| Colour | Source |
+|---|---|
+| none | the game's own pixel, scaled up |
+| magenta | background under a redrawn shape, filled from a neighbouring game pixel |
+| cyan | bare ground, computed at the high resolution |
+| yellow | sky along the horizon |
+| blue | redrawn ground shape (field, river, village area) |
+| red | redrawn object (house, building, small far shape) |
+| orange | redrawn line (road) |
+| white | kept from the game's picture (aircraft, smoke, anything not recognised) |
 
 Limits of this first version:
 - Only for the later release of the game (LucasArts Air Combat Classics). With

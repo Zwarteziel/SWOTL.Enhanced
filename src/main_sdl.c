@@ -1231,6 +1231,17 @@ int main(int argc, char **argv) {
                     }
                     break;
                 }
+                if (sc == SDL_SCANCODE_F3 && (e.key.mod & SDL_KMOD_CTRL)) {
+                    if (down && !e.key.repeat) {
+                        if (!a->cfg.hires) set_status(a, "The source view needs the high-resolution 3D view (Ctrl+F4)");
+                        else {
+                            a->m->hires_sources = !a->m->hires_sources;
+                            set_status(a, a->m->hires_sources ? "Hi-res source view on (colours: see README)" : "Hi-res source view off");
+                        }
+                        send_key(a, 0x1D, 0);
+                    }
+                    break;
+                }
                 if (sc == SDL_SCANCODE_F9 && (e.key.mod & SDL_KMOD_CTRL)) {
                     if (down && !e.key.repeat) { a->cfg.show_fps = !a->cfg.show_fps; send_key(a, 0x1D, 0); }
                     break;

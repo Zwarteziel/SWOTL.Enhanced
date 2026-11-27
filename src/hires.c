@@ -81,6 +81,8 @@ struct Hires {
     uint64_t serial;
     /* compose scratch; hidx holds the redrawn view of frame hidx_serial */
     uint8_t *hidx; size_t hidx_size;
+    /* where each pixel of hidx comes from (SRC_*), for the source view */
+    uint8_t *hsrc;
     uint16_t *sbuf; size_t sbuf_size; /* ground in the renderer's sheared frame */
     uint64_t hidx_serial; int hidx_n;
     uint8_t skip[MAX_ITEMS];
@@ -104,6 +106,8 @@ struct Hires {
     /* background kind per game pixel (BG_*), and the sky colour beside the
      * horizon */
     uint8_t bgk1[320 * VIEW_MAX], sky1[320 * VIEW_MAX];
+    /* background pixels filled from a neighbour (not the game's own pixel) */
+    uint8_t cov1[320 * VIEW_MAX];
 };
 
 static int dbg_on(void);
@@ -144,6 +148,7 @@ Hires *hires_create(void) {
 void hires_destroy(Hires *h) {
     if (!h) return;
     free(h->hidx);
+    free(h->hsrc);
     free(h->sbuf);
     free(h);
 }
@@ -715,7 +720,25 @@ typedef struct {
     const uint8_t *bgk; const float *gm; float vh;
     /* sub-pixel shift of the horizon and of what the game ties to it */
     float vshift;
+    /* where the pixels come from (SRC_*), or NULL */
+    uint8_t *smap;
 } Target;
+
+/* Source view (Ctrl+F3): where each pixel of the redrawn view comes from */
+enum {
+    SRC_GAME,    /* the game's own pixel, scaled up */
+    SRC_FILL,    /* background under a redrawn shape, from a neighbouring game pixel */
+    SRC_BARE,    /* bare ground, computed at the high resolution */
+    SRC_SKY,     /* sky along the horizon */
+    SRC_GROUND,  /* redrawn ground shape */
+    SRC_POLY,    /* redrawn object (house, building, small far shape) */
+    SRC_LINE,    /* redrawn line (road) */
+    SRC_KEPT,    /* kept from the game's picture: aircraft, smoke, unknown */
+};
+static const uint8_t SRC_RGB[8][3] = {
+    {0, 0, 0}, {255, 0, 255}, {0, 255, 255}, {255, 255, 0},
+    {40, 90, 255}, {255, 0, 0}, {255, 140, 0}, {255, 255, 255},
+};
 
 enum { BG_GAME, BG_GROUND, BG_HORIZON };
 
@@ -788,11 +811,12 @@ static inline int ground_row(float v) {
     return g < 0 ? 0 : (g >= SHADE_N ? SHADE_N - 1 : g);
 }
 
-typedef struct { uint8_t col; } PaintCtx;
+typedef struct { uint8_t col, src; } PaintCtx;
 
 static void span_paint(const Target *t, int row, int x0, int x1, void *ctx) {
     const PaintCtx *p = ctx;
     memset(t->dst + (size_t)row * t->w + x0, p->col, (size_t)(x1 - x0));
+    if (t->smap) memset(t->smap + (size_t)row * t->w + x0, p->src, (size_t)(x1 - x0));
 }
 
 typedef struct { Hires *h; uint8_t kind, col; } MarkCtx;
@@ -887,7 +911,7 @@ static void draw_ground(Hires *h, const HFrame *f, const HItem *it, const Target
         h->sbuf_size = need;
     }
     memset(h->sbuf, 0, need * sizeof *h->sbuf);
-    Target ts = {NULL, sw, sh, s, sbot, NULL, NULL, NULL, 0, 0};
+    Target ts = {NULL, sw, sh, s, sbot, NULL, NULL, NULL, 0, 0, NULL};
     /* consecutive edges with the same polygon number form a polygon; pass 1
      * fills them exactly, pass 2 redoes the top scanlines like the game */
     int ktop = (int)it->vtop - 1;
@@ -949,7 +973,10 @@ static void draw_ground(Hires *h, const HFrame *f, const HItem *it, const Target
             if (t->bgk && t->bgk[gi] == BG_HORIZON) { if (map_v(t->gm, X, R) >= t->vh) continue; }
             else if (t->gmask && !t->gmask[gi]) continue;
             if (mark) { h->kind1[gi] = 1; h->base1[gi] = col; }
-            else t->dst[(size_t)r * t->w + x] = shade ? (uint8_t)(col + shade[ground_row(v - t->vshift)]) : col;
+            else {
+                t->dst[(size_t)r * t->w + x] = shade ? (uint8_t)(col + shade[ground_row(v - t->vshift)]) : col;
+                if (t->smap) t->smap[(size_t)r * t->w + x] = SRC_GROUND;
+            }
         }
     }
 }
@@ -967,11 +994,11 @@ static void draw_items(Hires *h, const HFrame *f, const Target *t, int mark, con
             HVert a = {v[0].x + it->t0 * (v[1].x - v[0].x), v[0].y + it->t0 * (v[1].y - v[0].y)};
             HVert b = {v[0].x + it->t1 * (v[1].x - v[0].x), v[0].y + it->t1 * (v[1].y - v[0].y)};
             if (mark) { MarkCtx mc = {h, 2, it->col}; fill_line(t, a, b, 0.5f, span_mark, &mc); }
-            else { PaintCtx pc = {it->col}; fill_line(t, a, b, 0.45f, span_paint, &pc); }
+            else { PaintCtx pc = {it->col, SRC_LINE}; fill_line(t, a, b, 0.45f, span_paint, &pc); }
         } else {
             const HVert *v = f->verts + it->first;
             if (mark) { MarkCtx mc = {h, 3, it->col}; fill_poly(t, v, it->n, span_mark, &mc); }
-            else { PaintCtx pc = {it->col}; fill_poly(t, v, it->n, span_paint, &pc); }
+            else { PaintCtx pc = {it->col, SRC_POLY}; fill_poly(t, v, it->n, span_paint, &pc); }
         }
     }
 }
@@ -1011,7 +1038,7 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
     memset(h->skip, 0, sizeof h->skip);
 
     /* 1. coverage at the game's resolution */
-    Target t1 = {NULL, W, vh, 1, f->bot, f->gmask, NULL, NULL, 0, 0};
+    Target t1 = {NULL, W, vh, 1, f->bot, f->gmask, NULL, NULL, 0, 0, NULL};
     memset(h->kind1, 0, (size_t)W * vh);
     draw_items(h, f, &t1, 1, NULL);
 
@@ -1109,6 +1136,7 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
             /* pixels a line or object routine drew are not background */
             if (f->lmask[i] && src[i] == f->lval[i]) cov = 1;
             h->other1[i] = (uint8_t)cov; /* temporarily: covered mask */
+            h->cov1[i] = (uint8_t)cov;
         }
         for (int x = 0; x < W; x++) {
             int i = r * W + x;
@@ -1255,28 +1283,34 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
     if (h->hidx_size < need) {
         free(h->hidx);
         h->hidx = malloc(need);
-        if (!h->hidx) { h->hidx_size = 0; h->hidx_serial = 0; return 0; }
+        free(h->hsrc);
+        h->hsrc = malloc(need);
+        if (!h->hidx || !h->hsrc) { free(h->hidx); free(h->hsrc); h->hidx = h->hsrc = NULL; h->hidx_size = 0; h->hidx_serial = 0; return 0; }
         h->hidx_size = need;
     }
     for (int r = 0; r < HH; r++) {
-        const uint8_t *b = h->bg1 + (r / n) * W, *k = h->bgk1 + (r / n) * W, *sk = h->sky1 + (r / n) * W;
-        uint8_t *d = h->hidx + (size_t)r * HW;
+        const uint8_t *b = h->bg1 + (r / n) * W, *k = h->bgk1 + (r / n) * W, *sk = h->sky1 + (r / n) * W, *cv = h->cov1 + (r / n) * W;
+        uint8_t *d = h->hidx + (size_t)r * HW, *ds = h->hsrc + (size_t)r * HW;
         float R = (r + 0.5f) / n;
         for (int x = 0; x < W; x++) {
-            if (k[x] == BG_GAME) { memset(d + x * n, b[x], (size_t)n); continue; }
+            if (k[x] == BG_GAME) { memset(d + x * n, b[x], (size_t)n); memset(ds + x * n, cv[x] ? SRC_FILL : SRC_GAME, (size_t)n); continue; }
             for (int xx = 0; xx < n; xx++) {
                 float X = (x * n + xx + 0.5f) / n, v = map_v(gm, X, R);
                 int ground = k[x] == BG_GROUND || v < gvh;
                 d[x * n + xx] = ground ? (uint8_t)BARE(ground_row(v - gshift)) : sk[x];
+                ds[x * n + xx] = ground ? SRC_BARE : SRC_SKY;
             }
         }
     }
-    Target tn = {h->hidx, HW, HH, n, f->bot, f->gmask, precise ? h->bgk1 : NULL, gm, gvh, precise ? gshift : 0.f};
+    Target tn = {h->hidx, HW, HH, n, f->bot, f->gmask, precise ? h->bgk1 : NULL, gm, gvh, precise ? gshift : 0.f, h->hsrc};
     draw_items(h, f, &tn, 0, shade);
     for (int r = 0; r < vh; r++)
         for (int x = 0; x < W; x++)
             if (h->other1[r * W + x])
-                for (int yy = 0; yy < n; yy++) memset(h->hidx + (size_t)(r * n + yy) * HW + x * n, src[r * W + x], (size_t)n);
+                for (int yy = 0; yy < n; yy++) {
+                    memset(h->hidx + (size_t)(r * n + yy) * HW + x * n, src[r * W + x], (size_t)n);
+                    memset(h->hsrc + (size_t)(r * n + yy) * HW + x * n, SRC_KEPT, (size_t)n);
+                }
     h->hidx_serial = f->serial; h->hidx_n = n;
     if (dbg_on()) {
         int no = 0, ns = 0, nl = 0, np = 0, nu = 0;
@@ -1318,6 +1352,16 @@ screen:;
                     const uint8_t *hi = h->hidx + (size_t)(y * n + yy) * HW + x * n;
                     uint32_t *oo = o + (size_t)yy * HW;
                     for (int xx = 0; xx < n; xx++) oo[xx] = pal[hi[xx] & mask];
+                    if (m->hires_sources) {
+                        /* source view: half the picture, half the colour of the source */
+                        const uint8_t *hs = h->hsrc + (size_t)(y * n + yy) * HW + x * n;
+                        for (int xx = 0; xx < n; xx++) {
+                            if (hs[xx] == SRC_GAME) continue;
+                            const uint8_t *c = SRC_RGB[hs[xx] & 7];
+                            uint32_t p = oo[xx];
+                            oo[xx] = (p & 0xFF000000u) | ((((p >> 16) & 255) + c[2]) / 2) << 16 | ((((p >> 8) & 255) + c[1]) / 2) << 8 | (((p & 255) + c[0]) / 2);
+                        }
+                    }
                 }
             } else {
                 uint32_t c = pal[v & mask];
