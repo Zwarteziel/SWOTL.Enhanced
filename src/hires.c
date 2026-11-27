@@ -1215,15 +1215,29 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
                 near[r * W + x] = (uint8_t)v;
             }
         float band = 0.5f * (fabsf(gm[3]) + fabsf(gm[4])) + 1.5f;
+        /* how far the scanline changes within one game pixel */
+        float dv = 0.5f * (fabsf(gm[3]) + fabsf(gm[4]));
         for (int r = 0; r < vh; r++)
             for (int x = 0; x < W; x++) {
                 int i = r * W + x;
                 float v = map_v(gm, x + 0.5f, r + 0.5f), d = v - gvh;
                 int bare = BARE(ground_row(v - gshift)), bare1 = BARE(ground_row(v));
+                /* the ground the renderer drew here, also where a line or
+                 * object of the game has drawn over it since: taking the
+                 * game's pixels (or a neighbour) there brings back its whole
+                 * pixel steps, which jump with every rounding of the game */
+                int g = -1;
+                if (f->gmask[i]) {
+                    if (src[i] == f->gval[i]) g = src[i];
+                    else if (f->lmask[i] && src[i] == f->lval[i]) g = f->gval[i];
+                }
+                /* bare ground of the scanline here or of one the game pixel
+                 * also touches (the game shades per scanline of its own) */
+                int bareish = g >= 0 && (g == bare1 || g == BARE(ground_row(v - dv)) || g == BARE(ground_row(v + dv)));
                 if (fabsf(d) < band) {
                     h->bgk1[i] = BG_HORIZON;
                     if (d < 0) h->bg1[i] = (uint8_t)bare;
-                } else if (f->gmask[i] && src[i] == f->gval[i] && (near[i] || src[i] == bare1)) {
+                } else if (g >= 0 && (near[i] || bareish)) {
                     h->bgk1[i] = BG_GROUND;
                     h->bg1[i] = (uint8_t)bare;
                 }
