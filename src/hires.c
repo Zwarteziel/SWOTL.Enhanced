@@ -101,6 +101,12 @@ struct Hires {
     /* the precise horizon minus the game's, for the reference values of
      * the projection's long route in this frame (see 7B09) */
     float f0_shift;
+    /* [22EC] of this frame: the game's value and the precise one at scale
+     * SB_N (see rerun_projection) */
+    int32_t ec_game, ec_n; int ec_ok;
+    /* the colour tables per scanline (shade, bare ground, sky), as last
+     * used, relative to the game's horizon (see stabilize) */
+    int16_t st_prev[3][128], st_cand[3][128]; int st_ok[3];
     uint8_t vprev[320 * VIEW_MAX];   /* screen mask of the previous ready frame */
     /* pixels of the screen the game's present routine writes: the 3D view
      * (the cockpit is never written by it), collected over the frames */
@@ -277,7 +283,11 @@ static void rerun_projection(Hires *h, Machine *m, CPU *c) {
     ww(mem, ds + 0x258F, (uint16_t)(l8f > 0xFFFF ? 0xFFFF : l8f));
     ww(mem, ds + 0x2599, (uint16_t)(l99 > 0x7FFF ? 0x7FFF : l99));
     /* reference values of the long route, in the same scale */
-    int32_t ec = rd32(mem, ds + 0x22EC) * N;
+    /* [22EC] is a projected y the game kept as a reference (69F2, copied
+     * from [22E2] in an earlier projection of this frame), a whole pixel:
+     * the precise value of that projection is used when known */
+    int32_t ec_game = rd32(mem, ds + 0x22EC);
+    int32_t ec = (h->ec_ok && ec_game == h->ec_game) ? h->ec_n : ec_game * N;
     ww(mem, ds + 0x22EC, (uint16_t)ec); ww(mem, ds + 0x22EE, (uint16_t)((uint32_t)ec >> 16));
     int32_t f0 = rd32(mem, ds + 0x22F0);
     /* the game ties the far ground to its horizon through [22F0], a whole
@@ -293,12 +303,14 @@ static void rerun_projection(Hires *h, Machine *m, CPU *c) {
     ww(mem, ss + c->r[SP], ip);
     c->ip = 0x6667;
     int n = 0;
-    int fpath = 0, lpath = 0;
+    int fpath = 0, lpath = 0, ecset = 0;
     while (n < 20000 && !(c->ip == ip && c->r[SP] == save.r[SP] && c->s[CS] == save.s[CS])) {
         cpu_step(c); n++;
         if (c->ip == 0x6806) fpath = 1;
         if (c->ip == 0x6806 || c->ip == 0x6811) lpath = 1;
+        if (c->ip == 0x69F2) ecset = 1;
     }
+    if (ecset && n < 20000) { h->ec_n = rd32(mem, ds + 0x22EC); h->ec_game = ec_game; h->ec_ok = 1; }
     int32_t xn = rd32(mem, ds + 0x22DE), yn = rd32(mem, ds + 0x22E2);
 
     memcpy(mem + ds + 0x2200, h->save_vars, sizeof h->save_vars);
@@ -723,6 +735,7 @@ void hires_present(Hires *h, Machine *m, CPU *c) {
     h->pending_poly = h->pending_line = -1;
     h->f0_shift = 0.f;
     f->hshift_ok = 0;
+    h->ec_ok = 0;
     h->gen++;
 }
 
@@ -793,7 +806,7 @@ static const uint8_t SRC_RGB[8][3] = {
     {40, 90, 255}, {255, 0, 0}, {255, 140, 0}, {255, 255, 255},
 };
 
-enum { BG_GAME, BG_GROUND, BG_HORIZON };
+enum { BG_GAME, BG_GROUND, BG_HORIZON, BG_SKY };
 
 typedef void (*SpanFn)(const Target *t, int row, int x0, int x1, void *ctx);
 
@@ -1034,6 +1047,28 @@ static void draw_ground(Hires *h, const HFrame *f, const HItem *it, const Target
     }
 }
 
+/* A colour table per scanline of the renderer (index g, SHADE_OFF added)
+ * is learned anew from the game's pixels every frame. Near the horizon a
+ * row can come out one way in one frame and the other way in the next
+ * (the band of haze is one row wider or not), which made those rows
+ * flicker. A row only changes once the new value is seen in two frames in
+ * a row; rows are counted from the game's horizon vt, which they move
+ * with. */
+static void stabilize(Hires *h, int which, int vt, int *tab) {
+    int16_t *prev = h->st_prev[which], *cand = h->st_cand[which];
+    for (int d = 0; d < 128; d++) {
+        int g = vt - 64 + d + SHADE_OFF;
+        if (g < 0 || g >= SHADE_N) continue;
+        int cur = tab[g];
+        if (!h->st_ok[which]) { prev[d] = (int16_t)cur; cand[d] = -1; continue; }
+        if (cur == prev[d]) cand[d] = -1;
+        else if (cand[d] == cur) { prev[d] = (int16_t)cur; cand[d] = -1; }
+        else cand[d] = (int16_t)cur;
+        tab[g] = prev[d];
+    }
+    h->st_ok[which] = 1;
+}
+
 /* draws all items of a frame into a target */
 static void draw_items(Hires *h, const HFrame *f, const Target *t, int mark, const int8_t *shade) {
     for (int i = 0; i < f->ni; i++) {
@@ -1172,6 +1207,18 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
         }
     }
 #define BARE(gr) (gbase + bshade[gr])
+    {
+        static int tmp[SHADE_N];
+        int vt = (int)gvtop;
+        if (gfound) {
+            for (int g = 0; g < SHADE_N; g++) tmp[g] = shade[g];
+            stabilize(h, 0, vt, tmp);
+            for (int g = 0; g < SHADE_N; g++) shade[g] = (int8_t)tmp[g];
+            for (int g = 0; g < SHADE_N; g++) tmp[g] = bshade[g];
+            stabilize(h, 1, vt, tmp);
+            for (int g = 0; g < SHADE_N; g++) bshade[g] = (int8_t)tmp[g];
+        }
+    }
 
     /* 3. background: the game's picture with the redrawn shapes (and one
      * pixel around them) filled from the nearest pixel of the same kind
@@ -1240,6 +1287,9 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
     }
     gvh += gshift;
     int precise = gfound && f->gok && gbase >= 0;
+    /* sky colour per scanline of the renderer's frame (see below) */
+    static uint8_t skytab[SHADE_N];
+    int skyok = 0;
     if (precise) {
         /* near[]: within 3 pixels of a redrawn ground shape (sky1 as scratch) */
         uint8_t *rowmax = h->exp1, *near = h->sky1;
@@ -1297,6 +1347,60 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
                 h->sky1[i] = best >= 0 ? src[best] : r > 0 ? (h->bgk1[i - W] == BG_HORIZON ? h->sky1[i - W] : h->bg1[i - W]) : src[i];
                 if (map_v(gm, x + 0.5f, r + 0.5f) >= gvh) h->bg1[i] = h->sky1[i];
             }
+        /* the sky at the higher resolution. The game draws it in bands
+         * parallel to the horizon, one colour per scanline of the
+         * renderer's frame, tied to its rounded horizon like the ground's
+         * shading; taken from its pixels, the bands came out as steps of
+         * whole game pixels that jumped with every rounding (most of all
+         * along the horizon). The colour per scanline is learned from the
+         * game's sky and drawn at the precise horizon. */
+        {
+            static uint16_t sc[SHADE_N][256];
+            memset(sc, 0, sizeof sc);
+            for (int i = 0; i < W * vh; i++) {
+                if (f->gmask[i] || h->cov1[i]) continue;
+                float v = map_v(gm, i % W + 0.5f, i / W + 0.5f);
+                if (v < gvh) continue;
+                uint16_t *c = sc[ground_row(v)] + src[i];
+                if (*c < 65535) (*c)++;
+            }
+            int have[SHADE_N], n = 0;
+            for (int g = 0; g < SHADE_N; g++) {
+                int best = -1;
+                for (int c = 0; c < 256; c++) if (sc[g][c] && (best < 0 || sc[g][c] > sc[g][best])) best = c;
+                have[g] = best >= 0 && sc[g][best] >= 4;
+                if (have[g]) { skytab[g] = (uint8_t)best; n++; }
+            }
+            int lo = SHADE_N, hi = -1;
+            for (int g = 0; g < SHADE_N; g++) if (have[g]) { if (g < lo) lo = g; hi = g; }
+            /* rows without enough sky: the colour of the nearest row that
+             * has it (just above the horizon: the row above) */
+            for (int g = 0; g < SHADE_N; g++) if (!have[g] && n) {
+                for (int dd = 1; dd < SHADE_N; dd++) {
+                    if (g + dd < SHADE_N && have[g + dd]) { skytab[g] = skytab[g + dd]; break; }
+                    if (g - dd >= 0 && have[g - dd]) { skytab[g] = skytab[g - dd]; break; }
+                }
+            }
+            skyok = n >= 2;
+            if (skyok) {
+                static int tmp[SHADE_N];
+                for (int g = 0; g < SHADE_N; g++) tmp[g] = skytab[g];
+                stabilize(h, 2, (int)gvtop, tmp);
+                for (int g = 0; g < SHADE_N; g++) skytab[g] = (uint8_t)tmp[g];
+            }
+            if (skyok)
+                for (int r = 0; r < vh; r++)
+                    for (int x = 0; x < W; x++) {
+                        int i = r * W + x;
+                        if (h->bgk1[i] != BG_GAME || f->gmask[i] || h->cov1[i]) continue;
+                        float v = map_v(gm, x + 0.5f, r + 0.5f);
+                        if (v < gvh) continue;
+                        int g = ground_row(v);
+                        if (g < lo || g > hi + 1) continue;
+                        if (src[i] == skytab[g] || src[i] == skytab[ground_row(v - dv)] || src[i] == skytab[ground_row(v + dv)])
+                            h->bgk1[i] = BG_SKY;
+                    }
+        }
     }
 
     /* 4. what the redraw gives at the game's resolution; pixels that differ
@@ -1351,8 +1455,8 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
             if (k[x] == BG_GAME) { memset(d + x * n, b[x], (size_t)n); memset(ds + x * n, cv[x] ? SRC_FILL : SRC_GAME, (size_t)n); continue; }
             for (int xx = 0; xx < n; xx++) {
                 float X = (x * n + xx + 0.5f) / n, v = map_v(gm, X, R);
-                int ground = k[x] == BG_GROUND || v < gvh;
-                d[x * n + xx] = ground ? (uint8_t)BARE(ground_row(v - gshift)) : sk[x];
+                int ground = k[x] == BG_GROUND || (k[x] == BG_HORIZON && v < gvh);
+                d[x * n + xx] = ground ? (uint8_t)BARE(ground_row(v - gshift)) : skyok ? skytab[ground_row(v - gshift)] : sk[x];
                 ds[x * n + xx] = ground ? SRC_BARE : SRC_SKY;
             }
         }
