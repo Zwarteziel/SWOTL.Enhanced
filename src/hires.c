@@ -32,7 +32,7 @@
 
 enum { IT_GROUND, IT_LINE, IT_POLY };
 
-typedef struct { float x1, y1, x2, y2; int32_t ix1, iy1, ix2, iy2; uint16_t ord; uint8_t col; } HEdge;
+typedef struct { float x1, y1, x2, y2; int32_t ix1, iy1, ix2, iy2; uint16_t ord; uint8_t col, exact1, exact2; } HEdge;
 /* For a ground pass: m maps a screen point (x, row; game pixels, row
  * pointing down) to the renderer's frame: u = m0*x + m1*row + m2 (along a
  * scanline), v = m3*x + m4*row + m5 (the scanline, y up). vtop: its first
@@ -49,6 +49,9 @@ typedef struct {
     float bot;           /* buffer row = bot - y */
     double time_us;
     uint64_t serial;
+    /* the precise horizon minus the game's in this frame (set at 7B09 and
+     * used by the projection as well as for drawing); hshift_ok = 0: none */
+    float hshift; int hshift_ok;
     /* pixels written by the scanline renderer (the visible ground), at the
      * game's resolution, for buffer segment gseg */
     uint8_t gmask[320 * VIEW_MAX], gval[320 * VIEW_MAX];
@@ -90,8 +93,14 @@ struct Hires {
     uint8_t wmap[320 * VIEW_MAX]; /* CPU write tracking map */
     uint16_t wtag[320 * VIEW_MAX]; /* scanline of each pixel the ground renderer wrote */
     int gitem;           /* ground item being rendered, -1 = none */
-    float kref; int kref_n; uint64_t kref_serial; /* horizon below the point ahead */
+    float kref; int kref_n; /* horizon below the point ahead (learned at 7B09) */
+    float kprev; int kprev_ok;
     float hz_last; int hz_ok; /* the horizon last used (hysteresis) */
+    /* the last measured mapping of the ground renderer (see fit_ground) */
+    float lastm[6]; int lastm_ok; uint8_t lastm_orient;
+    /* the precise horizon minus the game's, for the reference values of
+     * the projection's long route in this frame (see 7B09) */
+    float f0_shift;
     uint8_t vprev[320 * VIEW_MAX];   /* screen mask of the previous ready frame */
     /* pixels of the screen the game's present routine writes: the 3D view
      * (the cockpit is never written by it), collected over the frames */
@@ -130,8 +139,9 @@ static const struct { uint16_t off; uint8_t len; uint8_t b[12]; } sigs[] = {
     {0x7EB6, 10, {0xBE, 0x45, 0x24, 0xBB, 0x00, 0x00, 0x8B, 0x0E, 0x79, 0x23}},
     {0x7B62, 4, {0x8E, 0x06, 0x79, 0x25}},
     {0x8D38, 4, {0x8E, 0x06, 0x79, 0x25}},
+    {0x7AF2, 11, {0xA3, 0x3A, 0x23, 0x40, 0xA3, 0x38, 0x23, 0x33, 0xD2, 0x03, 0x06}},
 };
-static const uint16_t bps[] = {0x7EB6, 0x663F, 0x8A8B, 0x8C6B, 0x7FB2, 0x7621, 0x7B42, 0x7BBF, 0x8CEC, 0x8D26, 0x769A, 0x9122, 0x7EB5};
+static const uint16_t bps[] = {0x7EB6, 0x663F, 0x8A8B, 0x8C6B, 0x7FB2, 0x7621, 0x7B42, 0x7BBF, 0x8CEC, 0x8D26, 0x769A, 0x9122, 0x7EB5, 0x7B09};
 
 Hires *hires_create(void) {
     Hires *h = calloc(1, sizeof *h);
@@ -212,17 +222,20 @@ static void hash_put(Hires *h, int32_t x, int32_t y, float fx, float fy) {
     }
 }
 
-/* the precise position of a projected point, or the game's own value */
-static HVert lookup(Hires *h, int32_t x, int32_t y) {
+/* the precise position of a projected point, or the game's own value
+ * (*exact = 0) */
+static HVert lookup_ex(Hires *h, int32_t x, int32_t y, uint8_t *exact) {
     uint32_t k = hkey(x, y);
     for (int i = 0; i < 64; i++) {
         HSlot *s = &h->hash[(k + i) & (HASH_SIZE - 1)];
         if (s->gen != h->gen) break;
-        if (s->x == x && s->y == y) return (HVert){s->fx, s->fy};
+        if (s->x == x && s->y == y) { if (exact) *exact = 1; return (HVert){s->fx, s->fy}; }
     }
+    if (exact) *exact = 0;
     /* the game truncates y down by about half a pixel */
     return (HVert){(float)x, (float)y + 0.5f};
 }
+static HVert lookup(Hires *h, int32_t x, int32_t y) { return lookup_ex(h, x, y, NULL); }
 
 /* 64: the precise points are known to 1/64 pixel. With 16 a line moving
  * slowly sideways went a little back and forth along a slight slope (one end
@@ -267,7 +280,12 @@ static void rerun_projection(Hires *h, Machine *m, CPU *c) {
     int32_t ec = rd32(mem, ds + 0x22EC) * N;
     ww(mem, ds + 0x22EC, (uint16_t)ec); ww(mem, ds + 0x22EE, (uint16_t)((uint32_t)ec >> 16));
     int32_t f0 = rd32(mem, ds + 0x22F0);
-    int32_t f1 = (int32_t)lround(N * (f0 - cy) + cy);
+    /* the game ties the far ground to its horizon through [22F0], a whole
+     * pixel that it rounds from the point straight ahead; that rounding
+     * flips from frame to frame in a bank, and the whole far ground
+     * jumped up and down with it. The precise horizon is used instead
+     * (the same one the redrawn horizon follows) */
+    int32_t f1 = (int32_t)lround(N * (f0 + h->f0_shift - cy) + cy);
     ww(mem, ds + 0x22F0, (uint16_t)f1); ww(mem, ds + 0x22F2, (uint16_t)((uint32_t)f1 >> 16));
 
     /* near call to 6667 that returns to where we are now */
@@ -275,10 +293,11 @@ static void rerun_projection(Hires *h, Machine *m, CPU *c) {
     ww(mem, ss + c->r[SP], ip);
     c->ip = 0x6667;
     int n = 0;
-    int fpath = 0;
+    int fpath = 0, lpath = 0;
     while (n < 20000 && !(c->ip == ip && c->r[SP] == save.r[SP] && c->s[CS] == save.s[CS])) {
         cpu_step(c); n++;
         if (c->ip == 0x6806) fpath = 1;
+        if (c->ip == 0x6806 || c->ip == 0x6811) lpath = 1;
     }
     int32_t xn = rd32(mem, ds + 0x22DE), yn = rd32(mem, ds + 0x22E2);
 
@@ -310,7 +329,7 @@ static void rerun_projection(Hires *h, Machine *m, CPU *c) {
      * such points to the game's value now and then, and they would
      * tremble. */
     if (fabs(fx - x1) > 2.5) fx = x1;
-    if (fabs(fy - y1) > 2.5) fy = y1 + 0.5;
+    if (fabs(fy - y1 - (lpath ? h->f0_shift : 0.f)) > 2.5) fy = y1 + 0.5;
     hash_put(h, x1, y1, (float)fx, (float)fy);
 }
 
@@ -453,6 +472,8 @@ static void fit_ground(Hires *h, HItem *it, int rows) {
     it->m[0] = u[0]; it->m[1] = u[1]; it->m[2] = u[2];
     it->m[3] = (float)p[0]; it->m[4] = (float)p[1]; it->m[5] = (float)p[2] + V_OFF;
     it->col = 0;
+    memcpy(h->lastm, it->m, sizeof h->lastm);
+    h->lastm_ok = 1; h->lastm_orient = it->orient;
 }
 
 void hires_breakpoint(Hires *h, Machine *m, CPU *c) {
@@ -471,12 +492,42 @@ void hires_breakpoint(Hires *h, Machine *m, CPU *c) {
         int32_t x2 = (int32_t)(rw(mem, ds + 0x236A) | (uint32_t)rw(mem, ds + 0x2368) << 16);
         int32_t y1 = (int32_t)(rw(mem, ds + 0x23FF) | (uint32_t)rw(mem, ds + 0x23FD) << 16);
         int32_t y2 = (int32_t)(rw(mem, ds + 0x236E) | (uint32_t)rw(mem, ds + 0x236C) << 16);
-        HVert a = lookup(h, x1, y1), b = lookup(h, x2, y2);
+        uint8_t xa, xb;
+        HVert a = lookup_ex(h, x1, y1, &xa), b = lookup_ex(h, x2, y2, &xb);
         HEdge *e = &f->edges[f->ne++];
+        e->exact1 = xa; e->exact2 = xb;
         e->x1 = a.x; e->y1 = a.y; e->x2 = b.x; e->y2 = b.y;
         e->ix1 = x1; e->iy1 = y1; e->ix2 = x2; e->iy2 = y2;
         e->col = (uint8_t)rw(mem, ds + 0x23D9);
         e->ord = rw(mem, ds + 0x252F);
+        break;
+    }
+    case 0x7B09: {
+        /* 7A7C has set the game's horizon for this frame ([2338], and
+         * [22F0] for the long route of the projection). Upright, the
+         * precise horizon is the point straight ahead plus the learned
+         * distance (see hires_compose, which does the same). */
+        h->f0_shift = 0.f;
+        int orient = rw(mem, ds + 0x25D0) & 7;
+        if (!h->lastm_ok || orient > 1 || h->lastm_orient != orient || !rw(mem, ds + 0x233E)) break;
+        float vtop = (int16_t)rw(mem, ds + 0x2338), bot = (int16_t)rw(mem, ds + 0x2593) + 1.5f;
+        HVert q = lookup(h, (int16_t)rw(mem, ds + 0x2304), (int16_t)rw(mem, ds + 0x2306));
+        float vref = h->lastm[3] * q.x + h->lastm[4] * (bot - q.y) + h->lastm[5], k = vtop - vref;
+        /* the distance between the point ahead and the game's horizon,
+         * learned as a running mean; in a bank the game's rounding flips
+         * from frame to frame, so two frames at a time */
+        if (!h->kref_n || fabsf(k - h->kref) > 2.f) { h->kref = k; h->kref_n = 0; h->kprev_ok = 0; }
+        float kp = h->kprev_ok ? 0.5f * (k + h->kprev) : k;
+        h->kprev = k; h->kprev_ok = 1;
+        h->kref += (kp - h->kref) / (float)(h->kref_n < 30 ? ++h->kref_n : 30);
+        float hz = vref + h->kref;
+        /* the precise point is known to 1/64 pixel and the game moves it a
+         * little back and forth from frame to frame; such small changes
+         * would make the shading bands along the horizon flicker, so the
+         * horizon only follows changes of more than 1/20 pixel */
+        if (h->hz_ok && fabsf(hz - h->hz_last) < 0.05f && fabsf(h->hz_last - vtop) <= 1.5f) hz = h->hz_last;
+        else { h->hz_last = hz; h->hz_ok = 1; }
+        if (fabsf(hz - vtop) <= 1.5f) { h->f0_shift = hz - vtop; f->hshift = h->f0_shift; f->hshift_ok = 1; }
         break;
     }
     case 0x7621: {
@@ -670,6 +721,8 @@ void hires_present(Hires *h, Machine *m, CPU *c) {
     memset(f->lmask, 0, sizeof f->lmask);
     h->pass_start = 0;
     h->pending_poly = h->pending_line = -1;
+    h->f0_shift = 0.f;
+    f->hshift_ok = 0;
     h->gen++;
 }
 
@@ -843,10 +896,10 @@ static void span_sfill(const Target *t, int row, int x0, int x1, void *ctx) {
  * horizon), and the haze below would show through as a blue band. */
 #define TOP_ROWS 3
 static float TOP_C = 1.0f;
-static void fill_rows(const Target *t, const HEdge *e, int n, SFillCtx *sc, int kmin, int kmax, float voff) {
+static void fill_rows(const Target *t, const HEdge *e, int n, SFillCtx *sc, int kmin, int kmax, float voff, float ysh) {
     float xs[64];
     for (int k = kmin; k <= kmax; k++) {
-        float y = k + TOP_C;
+        float y = k + TOP_C + ysh;
         int m = 0;
         for (int i = 0; i < n && m < 64; i++) {
             float y1 = e[i].y1, y2 = e[i].y2;
@@ -946,15 +999,15 @@ static void draw_ground(Hires *h, const HFrame *f, const HItem *it, const Target
                 pe[np] = *a; pe[np].x1 -= umin; pe[np].x2 -= umin;
                 /* the game cuts the shapes off just below its horizon, on
                  * whole scanlines: those corners move with the horizon */
-                if (pass == 0 && a->iy1 >= it->vtop - 2) pe[np].y1 += t->vshift;
-                if (pass == 0 && a->iy2 >= it->vtop - 2) pe[np].y2 += t->vshift;
+                if (pass == 0 && a->iy1 >= it->vtop - 2 && !a->exact1) pe[np].y1 += t->vshift;
+                if (pass == 0 && a->iy2 >= it->vtop - 2 && !a->exact2) pe[np].y2 += t->vshift;
                 np++;
             }
         }
         if (np >= 2) {
             SFillCtx sc = {h->sbuf, e[a0].col};
             if (pass == 0) fill_edges(&ts, pe, np, span_sfill, &sc);
-            else fill_rows(&ts, pe, np, &sc, ktop - TOP_ROWS + 1, ktop, V_OFF - 0.5f + t->vshift);
+            else fill_rows(&ts, pe, np, &sc, ktop - TOP_ROWS + 1, ktop, V_OFF - 0.5f + t->vshift, t->vshift);
         }
         a0 = k;
     }
@@ -1181,21 +1234,9 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
     for (int i = 0; i < f->ni; i++) {
         const HItem *gi = &f->items[i];
         if (gi->type != IT_GROUND || gi->col || gi->orient > 1) { continue; }
-        float vref = map_v(gi->m, gi->refx, f->bot - gi->refy), k = gi->vtop - vref;
-        if (h->kref_serial != f->serial) {
-            if (!h->kref_n || fabsf(k - h->kref) > 2.f) { h->kref = k; h->kref_n = 0; }
-            h->kref += (k - h->kref) / (float)(h->kref_n < 30 ? ++h->kref_n : 30);
-            h->kref_serial = f->serial;
-        }
-        float d = vref + h->kref - gi->vtop;
-        /* the precise point is known to 1/64 pixel and the game moves it a
-         * little back and forth from frame to frame; such small changes
-         * would make the shading bands along the horizon flicker, so the
-         * horizon only follows changes of more than 1/20 pixel */
-        float hz = gi->vtop + d;
-        if (h->hz_ok && fabsf(hz - h->hz_last) < 0.05f && fabsf(h->hz_last - gi->vtop) <= 1.5f) d = h->hz_last - gi->vtop;
-        else { h->hz_last = hz; h->hz_ok = 1; }
-        gshift = fabsf(d) <= 1.5f ? d : 0.f;
+        /* the shift worked out at 7B09 for this frame, which the
+         * projection used too (so the far ground and the horizon agree) */
+        if (f->hshift_ok) gshift = f->hshift;
     }
     gvh += gshift;
     int precise = gfound && f->gok && gbase >= 0;
