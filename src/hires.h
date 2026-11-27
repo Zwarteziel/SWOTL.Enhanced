@@ -30,6 +30,8 @@ void hires_present(Hires *h, struct Machine *m, CPU *c);
 void hires_present_done(Hires *h, struct Machine *m, CPU *c);
 /* Called by the CPU at a breakpoint. */
 void hires_breakpoint(Hires *h, struct Machine *m, CPU *c);
+/* a write into the game's data segment (see cpu.h sh_hook) */
+void hires_data_write(Hires *h, struct Machine *m, CPU *c, uint32_t a);
 
 /* Draws the current screen at 320*n x 200*n RGBA into out. Returns 1 if the
  * 3D view was redrawn, 0 if there is nothing to redraw (out is untouched). */

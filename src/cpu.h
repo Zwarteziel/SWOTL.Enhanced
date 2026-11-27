@@ -68,6 +68,12 @@ struct CPU {
      * linear address wt_tag_src in wt_tag[i] (the renderer's scanline) */
     uint16_t *wt_tag;
     uint32_t wt_tag_src;
+    /* data flow: rd_last is the linear address of the last data read; a
+     * write to linear address sh_lo + i (i < sh_len) calls sh_hook, which
+     * can tell from rd_last where the value came from. sh_len = 0: off. */
+    uint32_t rd_last;
+    uint32_t sh_lo, sh_len;
+    void (*sh_hook)(void *host, CPU *c, uint32_t a);
 };
 
 void cpu_reset(CPU *c);

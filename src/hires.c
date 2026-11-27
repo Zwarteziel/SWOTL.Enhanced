@@ -107,6 +107,12 @@ struct Hires {
     /* [22EC] of this frame: the game's value and the precise one at scale
      * SB_N (see rerun_projection) */
     int32_t ec_game, ec_n; int ec_ok;
+    /* where the values in the game's data segment came from: per word, the
+     * number of the projection (<< 2) and 1 for its x, 2 for its y; 0 for
+     * anything else (see hires_data_write) */
+    uint32_t dtag[32768];
+    struct { int32_t x, y; float fx, fy; uint32_t id; unsigned gen; } prec[4096];
+    uint32_t pseq, cur_proj;
     /* the colour tables per scanline (shade, bare ground, sky), as last
      * used, relative to the game's horizon (see stabilize) */
     int16_t st_prev[3][128], st_cand[3][128]; int st_ok[3];
@@ -213,6 +219,7 @@ int hires_scan(Hires *h, Machine *m, int in_3d) {
 void hires_detach(Hires *h, Machine *m) {
     (void)h;
     m->cpu.bp_cs = 0;
+    m->cpu.sh_len = 0;
     m->cpu.wt_len = 0;
     m->cpu.wt_tag = NULL;
 }
@@ -247,6 +254,42 @@ static HVert lookup_ex(Hires *h, int32_t x, int32_t y, uint8_t *exact) {
 }
 static HVert lookup(Hires *h, int32_t x, int32_t y) { return lookup_ex(h, x, y, NULL); }
 
+/* Every projection gets a number; the words the game writes into its data
+ * segment remember the number of the projection their value came from
+ * (read from its result [22DE]/[22E2], or copied from a word that has
+ * one). So a point can be told by where it came from, not only by its
+ * whole pixel: points close together often share a pixel, and the lookup
+ * by pixel then gives the other one, now and then (the two lines of a road
+ * crossed and parted from frame to frame). */
+static void record_proj(Hires *h, int32_t x, int32_t y, float fx, float fy) {
+    uint32_t id = ++h->pseq;
+    h->prec[id & 4095].x = x; h->prec[id & 4095].y = y;
+    h->prec[id & 4095].fx = fx; h->prec[id & 4095].fy = fy;
+    h->prec[id & 4095].id = id; h->prec[id & 4095].gen = h->gen;
+    h->cur_proj = id;
+}
+
+void hires_data_write(Hires *h, Machine *m, CPU *c, uint32_t a) {
+    (void)m;
+    uint32_t w = (a - c->sh_lo) >> 1, r = c->rd_last - c->sh_lo;
+    uint32_t tag = 0;
+    if (r >= 0x22DE && r < 0x22E6) { if (h->cur_proj) tag = h->cur_proj << 2 | (r < 0x22E2 ? 1u : 2u); }
+    else if (r < 0x10000) tag = h->dtag[r >> 1];
+    h->dtag[w & 32767] = tag;
+}
+
+/* the precise position of the point at DS:off (x, y as 32-bit values) */
+static HVert tagged_vert(Hires *h, const uint8_t *mem, uint32_t ds, uint16_t off) {
+    int32_t x = rd32(mem, ds + off), y = rd32(mem, ds + (uint16_t)(off + 4));
+    uint32_t tx = h->dtag[off >> 1], ty = h->dtag[(uint16_t)(off + 4) >> 1];
+    if ((tx & 3) == 1 && (ty & 3) == 2 && tx >> 2 == ty >> 2) {
+        uint32_t id = tx >> 2, k = id & 4095;
+        if (h->prec[k].id == id && h->prec[k].gen == h->gen && h->prec[k].x == x && h->prec[k].y == y)
+            return (HVert){h->prec[k].fx, h->prec[k].fy};
+    }
+    return lookup(h, x, y);
+}
+
 /* 64: the precise points are known to 1/64 pixel. With 16 a line moving
  * slowly sideways went a little back and forth along a slight slope (one end
  * a 1/16 step up, the motion down), which made its steps flicker. 128 is too
@@ -265,6 +308,7 @@ static void rerun_projection(Hires *h, Machine *m, CPU *c) {
     const int N = SB_N;
 
     CPU save = *c;
+    c->sh_len = 0; /* the rerun's own writes are not the game's (restored below with *c = save) */
     uint32_t sp0 = ss + (uint16_t)(c->r[SP] - 256);
     if (ds + 0x2800 > MEM_SIZE || sp0 + 512 > MEM_SIZE) return;
     memcpy(h->save_vars, mem + ds + 0x2200, sizeof h->save_vars);
@@ -324,7 +368,7 @@ static void rerun_projection(Hires *h, Machine *m, CPU *c) {
     memcpy(mem + cs + 0x67CC, h->save_code + 12, 3);
     memcpy(mem + cs + 0x6811, h->save_code + 15, 3);
     *c = save;
-    if (n >= 20000) return;
+    if (n >= 20000) { record_proj(h, x1, y1, (float)x1, y1 + 0.5f); return; }
 
     /* In the orientations on columns the x the projection gives is measured
      * from the vertical centre instead ([2595]..., also mirrored); take the
@@ -347,6 +391,7 @@ static void rerun_projection(Hires *h, Machine *m, CPU *c) {
     if (fabs(fx - x1) > 2.5) fx = x1;
     if (fabs(fy - y1 - (lpath ? h->f0_shift : 0.f)) > 2.5) fy = y1 + 0.5;
     hash_put(h, x1, y1, (float)fx, (float)fy);
+    record_proj(h, x1, y1, (float)fx, (float)fy);
 }
 
 static HItem *new_item(HFrame *f, int type) {
@@ -498,6 +543,7 @@ void hires_breakpoint(Hires *h, Machine *m, CPU *c) {
     uint32_t ds = (uint32_t)c->s[DS] << 4, ss = (uint32_t)c->s[SS] << 4;
     uint16_t sp = c->r[SP];
     h->ds = c->s[DS];
+    m->cpu.sh_lo = ds; m->cpu.sh_len = 0x10000;
     switch (c->ip) {
     case 0x663F: case 0x8A8B: case 0x8C6B:
         rerun_projection(h, m, c);
@@ -653,10 +699,9 @@ void hires_breakpoint(Hires *h, Machine *m, CPU *c) {
         if (f->nv + 2 > MAX_VERTS) break;
         HItem *it = new_item(f, IT_LINE);
         if (!it) break;
-        uint32_t v = ds + (uint16_t)(0x2445 + 8 * idx);
         it->first = (uint32_t)f->nv; it->n = 2;
-        f->verts[f->nv++] = lookup(h, rd32(mem, v), rd32(mem, v + 4));
-        f->verts[f->nv++] = lookup(h, rd32(mem, v + 8), rd32(mem, v + 12));
+        f->verts[f->nv++] = tagged_vert(h, mem, ds, (uint16_t)(0x2445 + 8 * idx));
+        f->verts[f->nv++] = tagged_vert(h, mem, ds, (uint16_t)(0x2445 + 8 * idx + 8));
         it->col = 0xFF;
         it->t0 = 0; it->t1 = 1;
         h->pending_line = f->ni - 1;
@@ -1114,19 +1159,82 @@ static void hold_strip(Hires *h, uint8_t *hidx, const uint8_t *hsrc, int HW, int
 }
 
 /* draws all items of a frame into a target */
+/* the part of a line the game drew (see 9122) */
+static void line_ends(const HFrame *f, const HItem *it, HVert *a, HVert *b) {
+    const HVert *v = f->verts + it->first;
+    *a = (HVert){v[0].x + it->t0 * (v[1].x - v[0].x), v[0].y + it->t0 * (v[1].y - v[0].y)};
+    *b = (HVert){v[0].x + it->t1 * (v[1].x - v[0].x), v[0].y + it->t1 * (v[1].y - v[0].y)};
+}
+
+/* lines of a road pair closer than this are filled between (game pixels) */
+#define PAIR_D 1.6f
+static float dist2(HVert p, HVert q) { return (p.x - q.x) * (p.x - q.x) + (p.y - q.y) * (p.y - q.y); }
+
+/* distance of point p to the line through a and b */
+static float seg_line_dist(HVert p, HVert a, HVert b) {
+    float dx = b.x - a.x, dy = b.y - a.y, l = sqrtf(dx * dx + dy * dy);
+    if (l < 1e-6f) return sqrtf(dist2(p, a));
+    return fabsf((p.x - a.x) * dy - (p.y - a.y) * dx) / l;
+}
+
+/* draws all items of a frame into a target */
 static void draw_items(Hires *h, const HFrame *f, const Target *t, int mark, const int8_t *shade) {
+    static uint8_t paired[MAX_ITEMS];
+    memset(paired, 0, (size_t)f->ni);
     for (int i = 0; i < f->ni; i++) {
         const HItem *it = &f->items[i];
         if (it->type != IT_GROUND && (it->col == 0xFF || h->skip[i])) continue;
         if (it->type == IT_GROUND) {
             if (!it->col) draw_ground(h, f, it, t, mark, shade);
         } else if (it->type == IT_LINE) {
-            /* only the part the game drew (see 9122) */
-            const HVert *v = f->verts + it->first;
-            HVert a = {v[0].x + it->t0 * (v[1].x - v[0].x), v[0].y + it->t0 * (v[1].y - v[0].y)};
-            HVert b = {v[0].x + it->t1 * (v[1].x - v[0].x), v[0].y + it->t1 * (v[1].y - v[0].y)};
+            HVert a, b;
+            line_ends(f, it, &a, &b);
             if (mark) { MarkCtx mc = {h, 2, it->col}; fill_line(t, a, b, 0.5f, span_mark, &mc); }
-            else { PaintCtx pc = {it->col, SRC_LINE}; fill_line(t, a, b, 0.45f, span_paint, &pc); }
+            else { PaintCtx pc = {it->col, SRC_LINE}; fill_line(t, a, b, 0.5f, span_paint, &pc); }
+            /* The game draws many roads as two lines side by side (there
+             * and back, between points a little apart), which make a road
+             * two pixels wide. Drawn exactly, a sliver of ground showed
+             * between them now and then, so the road flickered between one
+             * thick and two thin lines. The space between such a pair is
+             * filled as well. */
+            if (dist2(a, b) < 4.f) continue;
+            for (int j = i - 1; j >= 0 && j >= i - 1; j--) {
+                const HItem *o = &f->items[j];
+                if (o->type != IT_LINE || o->col != it->col || o->col == 0xFF || h->skip[j] || paired[j]) continue;
+                /* a pair is drawn one after the other, there and back: the
+                 * end of this line lies next to the start of the other one,
+                 * or the other way round */
+                {
+                    const HVert *va = f->verts + it->first, *vb = f->verts + o->first;
+                    if ((va[1].x - va[0].x) * (vb[1].x - vb[0].x) + (va[1].y - va[0].y) * (vb[1].y - vb[0].y) >= 0.f) continue;
+                    if (dist2(va[0], vb[1]) > 2.25f && dist2(va[1], vb[0]) > 2.25f) continue;
+                }
+                /* nearly the same line, side by side: the part of this line
+                 * that lies within PAIR_D pixels of the other one */
+                HVert c, d;
+                line_ends(f, o, &c, &d);
+                if (dist2(c, d) < 4.f) continue;
+                float sa = seg_line_dist(a, c, d), sb = seg_line_dist(b, c, d);
+                if (sa > PAIR_D && sb > PAIR_D) continue;
+                /* nearly parallel: at most 1 pixel apart per 8 along */
+                if (fabsf(sa - sb) > sqrtf(dist2(a, b)) / 8.f + 0.5f) continue;
+                HVert pa = a, pb = b;
+                if (sa > PAIR_D) { float u = (sa - PAIR_D) / (sa - sb); pa = (HVert){a.x + u * (b.x - a.x), a.y + u * (b.y - a.y)}; }
+                if (sb > PAIR_D) { float u = (PAIR_D - sa) / (sb - sa); pb = (HVert){a.x + u * (b.x - a.x), a.y + u * (b.y - a.y)}; }
+                /* between that part and the other line (within its drawn part) */
+                float ex = d.x - c.x, ey = d.y - c.y, el = ex * ex + ey * ey;
+                HVert q[4] = {pa, pb, pb, pa};
+                for (int k = 2; k < 4; k++) {
+                    float tt = ((q[k].x - c.x) * ex + (q[k].y - c.y) * ey) / el;
+                    if (tt < 0.f) tt = 0.f;
+                    if (tt > 1.f) tt = 1.f;
+                    q[k] = (HVert){c.x + tt * ex, c.y + tt * ey};
+                }
+                if (mark) { MarkCtx mc = {h, 2, it->col}; fill_poly(t, q, 4, span_mark, &mc); }
+                else { PaintCtx pc = {it->col, SRC_LINE}; fill_poly(t, q, 4, span_paint, &pc); }
+                paired[i] = paired[j] = 1;
+                break;
+            }
         } else {
             const HVert *v = f->verts + it->first;
             if (mark) { MarkCtx mc = {h, 3, it->col}; fill_poly(t, v, it->n, span_mark, &mc); }

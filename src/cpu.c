@@ -33,16 +33,26 @@ void mem_ww(CPU *c, uint32_t a, uint16_t v) {
 /* segment:offset accessors with 16-bit offset wrap; fast path for plain RAM */
 static inline uint8_t rb(CPU *c, uint16_t s, uint16_t o) {
     uint32_t a = cpu_lin(c, s, o);
+    c->rd_last = a;
     if (a < 0xA0000) return c->mem[a];
     return mem_rb(c, a);
 }
 static inline uint16_t rw(CPU *c, uint16_t s, uint16_t o) {
     uint32_t a = cpu_lin(c, s, o);
+    if (a < 0x9FFFF && o != 0xFFFF) { c->rd_last = a; return (uint16_t)(c->mem[a] | (c->mem[a + 1] << 8)); }
+    uint16_t v = (uint16_t)(rb(c, s, o) | (rb(c, s, (uint16_t)(o + 1)) << 8));
+    c->rd_last = a;
+    return v;
+}
+/* instruction fetch: not a data read */
+static inline uint16_t rw_code(CPU *c, uint16_t s, uint16_t o) {
+    uint32_t a = cpu_lin(c, s, o);
     if (a < 0x9FFFF && o != 0xFFFF) return (uint16_t)(c->mem[a] | (c->mem[a + 1] << 8));
-    return (uint16_t)(rb(c, s, o) | (rb(c, s, (uint16_t)(o + 1)) << 8));
+    return (uint16_t)(mem_rb(c, cpu_lin(c, s, o)) | (mem_rb(c, cpu_lin(c, s, (uint16_t)(o + 1))) << 8));
 }
 static inline void wb(CPU *c, uint16_t s, uint16_t o, uint8_t v) {
     uint32_t a = cpu_lin(c, s, o);
+    if (a - c->sh_lo < c->sh_len) c->sh_hook(c->host, c, a);
     uint32_t d = a - c->wt_lo;
     if (d < c->wt_len) {
         c->wt_map[d] = 1;
@@ -54,6 +64,7 @@ static inline void wb(CPU *c, uint16_t s, uint16_t o, uint8_t v) {
 static inline void ww(CPU *c, uint16_t s, uint16_t o, uint16_t v) {
     uint32_t a = cpu_lin(c, s, o);
     if (a < 0x9FFFF && o != 0xFFFF) {
+        if (a - c->sh_lo < c->sh_len) c->sh_hook(c->host, c, a);
         uint32_t d = a - c->wt_lo;
         if (d < c->wt_len) {
             c->wt_map[d] = 1;
@@ -73,7 +84,7 @@ void cpu_push(CPU *c, uint16_t v) { c->r[SP] -= 2; ww(c, c->s[SS], c->r[SP], v);
 uint16_t cpu_pop(CPU *c) { uint16_t v = rw(c, c->s[SS], c->r[SP]); c->r[SP] += 2; return v; }
 
 static inline uint8_t fetch8(CPU *c) { uint8_t v = c->mem[cpu_lin(c, c->s[CS], c->ip)]; c->ip++; return v; }
-static inline uint16_t fetch16(CPU *c) { uint16_t v = rw(c, c->s[CS], c->ip); c->ip += 2; return v; }
+static inline uint16_t fetch16(CPU *c) { uint16_t v = rw_code(c, c->s[CS], c->ip); c->ip += 2; return v; }
 
 /* byte registers: AL CL DL BL AH CH DH BH */
 static inline uint8_t getr8(CPU *c, int r) { return r < 4 ? (uint8_t)c->r[r] : (uint8_t)(c->r[r - 4] >> 8); }
