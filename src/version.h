@@ -2,6 +2,6 @@
  * file properties. */
 #ifndef SWOTL_VERSION_H
 #define SWOTL_VERSION_H
-#define APP_VERSION "0.1.32"
-#define APP_VERSION_NUM 0,1,32,0
+#define APP_VERSION "0.1.33"
+#define APP_VERSION_NUM 0,1,33,0
 #endif

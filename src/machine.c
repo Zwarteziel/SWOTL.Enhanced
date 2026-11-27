@@ -735,6 +735,7 @@ double machine_clock(Machine *m) { return m->clock_base + now_us(m) / 1e6; }
 Machine *machine_create(const char *gamedir, const char *exe, const char *args) {
     Machine *m = calloc(1, sizeof *m);
     m->clock_base = (double)time(NULL);
+    m->hires_hold = 1;
     if (getenv("SWOTL_CLOCK")) m->clock_base = atof(getenv("SWOTL_CLOCK"));
     m->mem = calloc(1, MEM_SIZE);
     m->vram = calloc(4, 65536);

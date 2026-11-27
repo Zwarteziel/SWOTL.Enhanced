@@ -121,6 +121,7 @@ typedef struct Machine {
     /* experimental high-resolution 3D view (NULL = off) */
     struct Hires *hires;
     int hires_sources;       /* source view of the high-resolution 3D view (Ctrl+F3) */
+    int hires_hold;          /* steady strip below the horizon (Ctrl+F2), default on */
 } Machine;
 
 Machine *machine_create(const char *gamedir, const char *exe, const char *args);

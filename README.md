@@ -1,6 +1,6 @@
 # SWOTL Enhanced
 
-Version 0.1.32
+Version 0.1.33
 
 Run **Secret Weapons of the Luftwaffe** (Lucasfilm Games, 1991) on modern Windows
 without installing DOSBox. You need your own copy of the original game files.
@@ -81,6 +81,7 @@ comments in the file are not carried over.
 | Ctrl+F6 | CRT shader on/off (saved in the ini file) |
 | Ctrl+F4 | High-resolution 3D view on/off (experimental, saved in the ini file) |
 | Ctrl+F3 | Source view of the high-resolution 3D view on/off (for testing; see below) |
+| Ctrl+F2 | Steady strip below the horizon on/off (high-resolution view; on by default; see below) |
 | Ctrl+F7 / Ctrl+F8 | Make the gamepad stick less / more curved (saved in the ini file) |
 | Ctrl+F5 | Start / stop a diagnostic recording (`swotl-rec-NNNN.avi` + `.log`, max 60 s) |
 
@@ -183,6 +184,14 @@ high-resolution view gets half the colour of where it comes from:
 | red | redrawn object (house, building, small far shape) |
 | orange | redrawn line (road) |
 | white | kept from the game's picture (aircraft, smoke, anything not recognised) |
+
+**Steady strip below the horizon (Ctrl+F2).** Just below its horizon the game
+itself changes its mind from frame to frame: a far field has a thin point one
+frame and not the next, a short road is drawn in one frame and not in the next.
+In a strip of 8 game pixels below the horizon, a pixel of the high-resolution
+view only changes when the change is still there in the next frame. That takes
+away most of this flicker; the price is that the strip runs one frame behind
+when something new appears in it. On by default, not saved.
 
 Limits of this first version:
 - Only for the later release of the game (LucasArts Air Combat Classics). With

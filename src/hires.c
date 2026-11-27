@@ -86,6 +86,9 @@ struct Hires {
     uint8_t *hidx; size_t hidx_size;
     /* where each pixel of hidx comes from (SRC_*), for the source view */
     uint8_t *hsrc;
+    /* the strip just below the horizon as last shown, per column and
+     * distance below the horizon (see hold_strip) */
+    uint8_t *hold_col; uint16_t *hold_cand; size_t hold_size; int hold_hw, hold_ok;
     uint16_t *sbuf; size_t sbuf_size; /* ground in the renderer's sheared frame */
     uint64_t hidx_serial; int hidx_n;
     uint8_t skip[MAX_ITEMS];
@@ -165,6 +168,7 @@ void hires_destroy(Hires *h) {
     if (!h) return;
     free(h->hidx);
     free(h->hsrc);
+    free(h->hold_col); free(h->hold_cand);
     free(h->sbuf);
     free(h);
 }
@@ -1069,6 +1073,46 @@ static void stabilize(Hires *h, int which, int vt, int *tab) {
     h->st_ok[which] = 1;
 }
 
+/* Just below its horizon the game decides from frame to frame whether a
+ * corner of a far shape is still in or already cut off (by its rounded
+ * horizon), and the shapes there get a thin point one frame and not the
+ * next; short roads there are drawn in some frames and not in others. In a
+ * strip HOLD_D game pixels high below the precise horizon, a pixel of the
+ * redrawn view (anything but the game's own background) only changes its
+ * colour when the new colour is there in two frames in a row; the strip is
+ * kept per column and distance below the horizon, so it moves with the
+ * horizon. Measured while pitching up and down: 3 pixels -23%, 8 pixels
+ * with lines and kept pixels -48% of the flicker. */
+#define HOLD_D 8
+static void hold_strip(Hires *h, uint8_t *hidx, const uint8_t *hsrc, int HW, int HH, int n, const float *gm, float hz) {
+    int J = HOLD_D * n;
+    size_t need = (size_t)HW * J;
+    if (h->hold_size != need || h->hold_hw != HW) {
+        free(h->hold_col); free(h->hold_cand);
+        h->hold_col = malloc(need); h->hold_cand = malloc(need * sizeof *h->hold_cand);
+        if (!h->hold_col || !h->hold_cand) { free(h->hold_col); free(h->hold_cand); h->hold_col = NULL; h->hold_cand = NULL; h->hold_size = 0; return; }
+        h->hold_size = need; h->hold_hw = HW; h->hold_ok = 0;
+    }
+    if (fabsf(gm[4]) < 0.5f) { h->hold_ok = 0; return; }
+    for (int x = 0; x < HW; x++) {
+        float X = (x + 0.5f) / n;
+        for (int j = 0; j < J; j++) {
+            size_t c = (size_t)x * J + j;
+            /* the screen row where the scanline is hz - (j + 0.5) / n */
+            float v = hz - (j + 0.5f) / n, R = (v - gm[3] * X - gm[5]) / gm[4];
+            int r = (int)floorf(R * n);
+            if (r < 0 || r >= HH) { h->hold_cand[c] = 0xFFFF; continue; }
+            size_t i = (size_t)r * HW + x;
+            int cur = hidx[i];
+            if (!h->hold_ok || (hsrc[i] == SRC_GAME || hsrc[i] == SRC_FILL)) { h->hold_col[c] = (uint8_t)cur; h->hold_cand[c] = 0xFFFF; continue; }
+            if (cur == h->hold_col[c]) h->hold_cand[c] = 0xFFFF;
+            else if (h->hold_cand[c] == cur) { h->hold_col[c] = (uint8_t)cur; h->hold_cand[c] = 0xFFFF; }
+            else { h->hold_cand[c] = (uint16_t)cur; hidx[i] = h->hold_col[c]; }
+        }
+    }
+    h->hold_ok = 1;
+}
+
 /* draws all items of a frame into a target */
 static void draw_items(Hires *h, const HFrame *f, const Target *t, int mark, const int8_t *shade) {
     for (int i = 0; i < f->ni; i++) {
@@ -1470,6 +1514,10 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
                     memset(h->hidx + (size_t)(r * n + yy) * HW + x * n, src[r * W + x], (size_t)n);
                     memset(h->hsrc + (size_t)(r * n + yy) * HW + x * n, SRC_KEPT, (size_t)n);
                 }
+    /* the strip below the horizon (upright only, where the precise
+     * horizon is known) */
+    if (precise && f->hshift_ok && m->hires_hold) hold_strip(h, h->hidx, h->hsrc, HW, HH, n, gm, gvh);
+    else h->hold_ok = 0;
     h->hidx_serial = f->serial; h->hidx_n = n;
     if (dbg_on()) {
         int no = 0, ns = 0, nl = 0, np = 0, nu = 0;
