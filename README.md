@@ -1,6 +1,6 @@
 # SWOTL Enhanced
 
-Version 0.1.35
+Version 0.1.36
 
 Run **Secret Weapons of the Luftwaffe** (Lucasfilm Games, 1991) on modern Windows
 without installing DOSBox. You need your own copy of the original game files.
@@ -195,6 +195,17 @@ variant can change; a short message shows the new one. `shader=crt-1080p`,
 `crt-1440p` or `crt-4k` forces one variant. `shader=none` switches the effect
 off. Ctrl+F6 switches between `crt-auto` and `none`.
 
+**With the high-resolution 3D view.** The CRT shader also works with the
+high-resolution view (Ctrl+F4); `shader` and Ctrl+F6 decide, as always. A VGA
+monitor shows the game's 320x200 mode as 400 lines, so the high-resolution
+picture goes through the shader as 400 lines as well, with the full
+horizontal detail: two lines of the 1280x800 picture become one line on the
+simulated monitor. That is still twice the vertical detail of the game, and it
+keeps room for the scanlines. The 1080p variant then draws the 400 lines
+directly instead of faking the double scan, so on a 1080p screen the
+scanlines look a little different in flight than in the menus. Without the
+shader you see all 800 lines.
+
 The shaders need OpenGL 3.3, which every PC graphics card from the last 15
 years supports. If OpenGL does not work, the program falls back to its normal
 renderer without the effect, and writes the reason to
@@ -245,7 +256,6 @@ Limits of this first version:
   stay at the original resolution.
 - The redrawn view runs one game frame behind the cockpit instruments, so
   that it never mixes old and new pixels.
-- The CRT shader is off while the high-resolution view is on.
 - It costs about 10% more CPU time for the emulation.
 
 ## Settings (`swotl-enhanced.ini`)

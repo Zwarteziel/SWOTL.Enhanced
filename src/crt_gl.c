@@ -345,6 +345,10 @@ const char *crtgl_info(CrtGL *g) { return g->info; }
 
 void crtgl_output_size(CrtGL *g, int *w, int *h) { SDL_GetWindowSizeInPixels(g->win, w, h); }
 
+#ifndef HIRES_CRT_W
+#define HIRES_CRT_W 1280
+#endif
+
 static void draw_tri(CrtGL *g) {
     p_glBindVertexArray(g->vao);
     p_glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -364,7 +368,7 @@ static void draw_simple(CrtGL *g, GLuint tex, int tw, int th, int linear, float 
     draw_tri(g);
 }
 
-const char *crtgl_frame(CrtGL *g, const uint32_t *rgba, int w, int h, int shader,
+const char *crtgl_frame(CrtGL *g, const uint32_t *rgba, int w, int h, int hires, int shader,
                         int scale_mode, int aspect, int integer_only, SDL_FRect *dst) {
     int ow, oh;
     SDL_GetWindowSizeInPixels(g->win, &ow, &oh);
@@ -387,10 +391,19 @@ const char *crtgl_frame(CrtGL *g, const uint32_t *rgba, int w, int h, int shader
      * real scanline emulation); otherwise it falls back to plain scaling */
     double dar = aspect ? 4.0 / 3.0 : 1.6;
     double fit_h = SDL_min((double)oh, ow / dar);
-    int dbl = h <= 240;                      /* double-scanned on a VGA monitor */
+    int dbl = h <= 240 || hires;             /* double-scanned on a VGA monitor */
     int rw = w < 640 ? w * 2 : w;            /* render size with pixel doubling */
     int rh = dbl ? h * 2 : h;
-    int fds_ok = dbl && h <= 1080 / 5;
+    int fds_ok = dbl && !hires && h <= 1080 / 5;
+    if (hires) {
+        /* A high-resolution picture of the 320x200 mode goes through the CRT
+         * shader as the 400 lines the monitor shows of that mode, with the
+         * horizontal detail kept up to HIRES_CRT_W: two lines of a 1280x800
+         * picture are averaged into one. A real VGA monitor cannot show more
+         * lines than that, and more would leave no room for scanlines. */
+        rw = w < HIRES_CRT_W ? w : HIRES_CRT_W;
+        rh = 400;
+    }
     enum { V_PLAIN, V_FDS, V_1080, V_1440, V_4K } v = V_PLAIN;
     switch (shader) {
     case SHADER_CRT_AUTO: {
@@ -456,7 +469,7 @@ const char *crtgl_frame(CrtGL *g, const uint32_t *rgba, int w, int h, int shader
     GLuint pr = g->p[P_IMAGE_ADJ].prog;
     p_glUseProgram(pr);
     p_glActiveTexture(GL_TEXTURE0);
-    tex_params(g->src_tex, 0, 1);
+    tex_params(g->src_tex, hires, 1);       /* linear: averages when scaling down */
     set1i(pr, "INPUT_TEXTURE_0", 0);
     set2f(pr, "INPUT_SIZE_0", (float)w, (float)h);
     set2f(pr, "OUTPUT_SIZE", (float)iw, (float)ih);

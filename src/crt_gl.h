@@ -28,9 +28,10 @@ void crtgl_destroy(CrtGL *g);
 /* Draws one frame of the game (RGBA bytes, w x h) to the window.
  * shader: SHADER_*; scale_mode: 0 nearest, 1 linear, 2 sharp (used without
  * CRT shader, and when the window is too small for one); aspect: 1 = 4:3.
+ * hires: the picture is a high-resolution version of the 320x200 mode.
  * dst receives the picture rectangle in window pixels. Returns a short name
  * of the variant in use. */
-const char *crtgl_frame(CrtGL *g, const uint32_t *rgba, int w, int h, int shader,
+const char *crtgl_frame(CrtGL *g, const uint32_t *rgba, int w, int h, int hires, int shader,
                         int scale_mode, int aspect, int integer_only, SDL_FRect *dst);
 /* Draws an RGBA overlay (with alpha) at window pixel x,y, scaled up. */
 void crtgl_overlay(CrtGL *g, const uint32_t *rgba, int w, int h, int x, int y, int scale);

@@ -207,8 +207,9 @@ static void config_write(const char *path, const Config *c) {
         "; hires (experimental): draw the 3D view (ground, roads, buildings) at a\n"
         "; higher resolution: 0 = off, 2, 3 or 4 = 640x400, 960x600 or 1280x800.\n"
         "; Aircraft, smoke and the cockpit stay as the game draws them. Only for\n"
-        "; the later release of the game (Air Combat Classics); the CRT shader is\n"
-        "; off while it is on. Ctrl+F4 switches between off and 4.\n"
+        "; the later release of the game (Air Combat Classics). With the CRT shader\n"
+        "; the picture goes through it as 400 lines, like the game on a VGA monitor.\n"
+        "; Ctrl+F4 switches between off and 4.\n"
         "hires=%d\n\n",
         c->fullscreen, c->width, c->height, shader_to_str(c->shader),
         c->renderer_sdl ? "sdl" : "opengl",
@@ -568,16 +569,20 @@ static void gl_text_box(App *a, int x, int y, const char *txt, uint32_t col) {
 }
 
 static void present_gl(App *a, const uint32_t *img, int w, int h) {
-    int shader = a->cfg.hires ? SHADER_NONE : a->cfg.shader;
-    const char *nm = crtgl_frame(a->gl, img, w, h, shader, a->cfg.scale_mode,
+    int shader = a->cfg.shader;
+    const char *nm = crtgl_frame(a->gl, img, w, h, img == a->hframe, shader, a->cfg.scale_mode,
                                  a->cfg.aspect, a->cfg.integer_only, &a->dst);
+    static int last_hi;
+    int hi = img == a->hframe;
     if (nm[0] && nm != a->shader_name) {
-        if (a->shader_name && shader != SHADER_NONE) {
+        /* not when only the 3D view switched between resolutions */
+        if (a->shader_name && shader != SHADER_NONE && hi == last_hi) {
             char msg[96]; snprintf(msg, sizeof msg, "Display: %s", nm);
             set_status(a, msg);
         }
         a->shader_name = nm;
     }
+    last_hi = hi;
     if (a->status[0] && SDL_GetTicks() < a->status_until) {
         gl_text_box(a, 4, 4, a->status, 0xFF78E6FFu);
     } else if (a->status[0]) {
