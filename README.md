@@ -1,6 +1,6 @@
 # SWOTL Enhanced
 
-Version 0.1.37
+Version 0.1.38
 
 Run **Secret Weapons of the Luftwaffe** (Lucasfilm Games, 1991) on modern Windows
 without installing DOSBox. You need your own copy of the original game files.
@@ -250,10 +250,12 @@ when something new appears in it. On by default, not saved.
 Limits of this first version:
 - Only for the later release of the game (LucasArts Air Combat Classics). With
   the 1991 release the setting has no effect and a message says so.
-- All views from the cockpit (forward, the side views, the shoulder views and
-  the rear view), except the view straight up, which shows only sky. The
-  aircraft's own wing in the side views is pixel art and stays as it is. The
-  map and the menus are shown as before.
+- All views from the cockpit (forward, side, shoulder, rear and up), and in
+  the B-17 also the gunner and bombardier positions. The aircraft's own wing
+  in the side views and the frames of the turrets are pixel art and stay as
+  they are. A view with only sky in it stays in high resolution too, so the
+  picture does not switch back and forth when a view or turret turns away
+  from the ground. The map and the menus are shown as before.
 - With ground detail off (Alt+G in the game) the plain ground and the horizon
   stay at the original resolution.
 - The redrawn view runs one game frame behind the cockpit instruments, so

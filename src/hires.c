@@ -785,9 +785,12 @@ void hires_present(Hires *h, Machine *m, CPU *c) {
     /* every view; the rear, up and shoulder views are narrower and placed
      * elsewhere on the screen */
     if (dbg_on()) fprintf(stderr, "[hires] present %04X ni=%d vw=%d vh=%d t=%.0f\n", seg, f->ni, vw, vh, m->time_us / 1000);
-    if (h->found > 0 && f->ni > 0 && vok && f->vw == vw && ((uint32_t)seg << 4) + (uint32_t)vw * vh < 0xA0000) {
+    /* also a frame with nothing to redraw (only sky, e.g. the view straight
+     * up): the picture then stays high-resolution instead of switching back
+     * and forth when a view or a turret turns away from the ground */
+    if (h->found > 0 && vok && (f->vw == vw || (!f->vw && !f->ni)) && ((uint32_t)seg << 4) + (uint32_t)vw * vh < 0xA0000) {
         memcpy(f->buf, m->mem + ((uint32_t)seg << 4), (size_t)vw * vh);
-        f->sx = sx; f->sy = sy;
+        f->vw = vw; f->sx = sx; f->sy = sy;
         /* no record of the renderer's pixels: allow the ground everywhere */
         f->gok = f->gseg == seg;
         if (!f->gok) memset(f->gmask, 1, sizeof f->gmask);
