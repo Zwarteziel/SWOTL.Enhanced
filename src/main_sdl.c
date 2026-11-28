@@ -46,6 +46,7 @@ typedef struct {
     char pad[32][32];    /* gamepad button mapping strings, by SDL_GamepadButton */
     char pad_lt[32], pad_rt[32];
     int rstick_views;
+    int diag_keys;       /* Ctrl+F2, Ctrl+F3 and Ctrl+F5 (for testing) */
     /* flight stick: any joystick that is not a gamepad */
     char stk[12][32];    /* button1..button12 */
     int stk_ax_x, stk_ax_y, stk_ax_thr, stk_ax_rud; /* axis numbers, -1 = not used */
@@ -170,13 +171,17 @@ static void config_write(const char *path, const Config *c) {
         "; what DOSBox gives on Windows; 10.9 and 500 is the slow power-on default.\n"
         "key_repeat_rate=%g\n"
         "key_repeat_delay=%g\n"
+        "; Diagnostic keys, for testing: Ctrl+F5 (recording), Ctrl+F3 (source view of\n"
+        "; the high-resolution 3D view) and Ctrl+F2 (steady strip below the horizon).\n"
+        "; 0 = off (these keys go to the game), 1 = on\n"
+        "diagnostic_keys=%d\n"
         "; Expert: pass your own SWOTL command line instead (e.g. V A 5 Y N Y 16)\n"
         "args=%s\n\n",
         c->gamedir, c->mips, c->detail, c->advanced,
         c->joystick < 0 ? "auto" : (c->joystick ? "on" : "off"),
         c->sound == 2 ? "sb" : (c->sound ? "1" : "0"), c->volume,
         c->kb_flight ? "stick" : "classic", c->kb_ramp, c->kb_return,
-        c->key_rate, c->key_delay, c->args);
+        c->key_rate, c->key_delay, c->diag_keys, c->args);
     fprintf(f,
         "[display]\n"
         "; Start in full screen: 0 or 1 (Alt+Enter or F11 switches)\n"
@@ -301,6 +306,7 @@ static void config_load(Config *cfg, const char *path) {
             else if (!strcmp(k, "sound")) cfg->sound = !SDL_strcasecmp(v, "sb") || !SDL_strcasecmp(v, "soundblaster") ? 2 : (!SDL_strcasecmp(v, "adlib") ? 1 : atoi(v));
             else if (!strcmp(k, "volume")) cfg->volume = atoi(v);
             else if (!strcmp(k, "args")) snprintf(cfg->args, sizeof cfg->args, "%s", v);
+            else if (!strcmp(k, "diagnostic_keys")) cfg->diag_keys = atoi(v) != 0;
             else if (!strcmp(k, "keyboard_flight")) cfg->kb_flight = !SDL_strcasecmp(v, "classic") || !strcmp(v, "0") ? 0 : 1;
             else if (!strcmp(k, "keyboard_stick_ramp")) { cfg->kb_ramp = (float)atof(v); if (cfg->kb_ramp < 0.05f) cfg->kb_ramp = 0.05f; if (cfg->kb_ramp > 3) cfg->kb_ramp = 3; }
             else if (!strcmp(k, "keyboard_stick_return")) { cfg->kb_return = (float)atof(v); if (cfg->kb_return < 0.02f) cfg->kb_return = 0.02f; if (cfg->kb_return > 3) cfg->kb_return = 3; }
@@ -1460,7 +1466,7 @@ int main(int argc, char **argv) {
                 if (a->recording && a->rec.log)
                     fprintf(a->rec.log, "KEY t=%llu sc=%d (%s) %s repeat=%d mod=%04X in3d=%d\n", (unsigned long long)(SDL_GetTicks() - a->rec_start), (int)sc,
                             SDL_GetScancodeName(sc), down ? "down" : "up", e.key.repeat, e.key.mod, machine_in_3d(a->m));
-                if (sc == SDL_SCANCODE_F5 && (e.key.mod & SDL_KMOD_CTRL)) {
+                if (a->cfg.diag_keys && sc == SDL_SCANCODE_F5 && (e.key.mod & SDL_KMOD_CTRL)) {
                     if (down && !e.key.repeat) { rec_toggle(a); send_key(a, 0x1D, 0); }
                     break;
                 }
@@ -1532,7 +1538,7 @@ int main(int argc, char **argv) {
                     }
                     break;
                 }
-                if (sc == SDL_SCANCODE_F2 && (e.key.mod & SDL_KMOD_CTRL)) {
+                if (a->cfg.diag_keys && sc == SDL_SCANCODE_F2 && (e.key.mod & SDL_KMOD_CTRL)) {
                     if (down && !e.key.repeat) {
                         if (!a->cfg.hires) set_status(a, "The steady horizon strip needs the high-resolution 3D view (Ctrl+F4)");
                         else {
@@ -1543,7 +1549,7 @@ int main(int argc, char **argv) {
                     }
                     break;
                 }
-                if (sc == SDL_SCANCODE_F3 && (e.key.mod & SDL_KMOD_CTRL)) {
+                if (a->cfg.diag_keys && sc == SDL_SCANCODE_F3 && (e.key.mod & SDL_KMOD_CTRL)) {
                     if (down && !e.key.repeat) {
                         if (!a->cfg.hires) set_status(a, "The source view needs the high-resolution 3D view (Ctrl+F4)");
                         else {

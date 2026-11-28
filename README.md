@@ -1,6 +1,6 @@
 # SWOTL Enhanced
 
-Version 0.1.38
+Version 0.1.39
 
 Run **Secret Weapons of the Luftwaffe** (Lucasfilm Games, 1991) on modern Windows
 without installing DOSBox. You need your own copy of the original game files.
@@ -82,10 +82,14 @@ comments in the file are not carried over.
 | Ctrl+F9 | Show speed, frame rate and CPU speed in the picture (they are always in the title bar) |
 | Ctrl+F6 | CRT shader on/off (saved in the ini file) |
 | Ctrl+F4 | High-resolution 3D view on/off (experimental, saved in the ini file) |
-| Ctrl+F3 | Source view of the high-resolution 3D view on/off (for testing; see below) |
-| Ctrl+F2 | Steady strip below the horizon on/off (high-resolution view; on by default; see below) |
+| Ctrl+F3 | Source view of the high-resolution 3D view on/off (diagnostic; see below) |
+| Ctrl+F2 | Steady strip below the horizon on/off (diagnostic; the strip is always on otherwise; see below) |
 | Ctrl+F7 / Ctrl+F8 | Make the gamepad stick less / more curved (saved in the ini file) |
-| Ctrl+F5 | Start / stop a diagnostic recording (`swotl-rec-NNNN.avi` + `.log`, max 60 s) |
+| Ctrl+F5 | Start / stop a diagnostic recording (`swotl-rec-NNNN.avi` + `.log`, max 60 s; diagnostic) |
+
+The diagnostic keys (Ctrl+F2, Ctrl+F3 and Ctrl+F5) are for testing and are off
+by default: then these keys go to the game. Set `diagnostic_keys=1` in the
+`[game]` section of the ini file to use them.
 
 All other keys go to the game. See `SWOTL.DOC` for the game's own keys.
 
@@ -125,7 +129,7 @@ around the centre give finer control, and full stick still gives full
 deflection. Try 1.5 to 2.0. `stick_range` (0.3 to 1.0) limits the maximum
 deflection. Ctrl+F7 / Ctrl+F8 change the curve in steps of 0.25 while you fly.
 
-**Diagnostic recording.** Ctrl+F5 records the game picture (320x200, 30 fps,
+**Diagnostic recording.** With `diagnostic_keys=1`, Ctrl+F5 records the game picture (320x200, 30 fps,
 uncompressed AVI) to `swotl-rec-NNNN.avi` in the game folder. The top-left
 corner of the picture shows the input state. A `.log` file next to it lists, for
 each frame, the timing (speed, fps, CPU speed), the keys and the stick values
@@ -225,7 +229,7 @@ computed a second time, with more precision, by running the game's own
 projection routine again on the side with a 64 times larger focal length.
 Anything it does not recognise is taken from the game's own picture.
 
-**Source view (Ctrl+F3).** For finding the cause of flicker. Every pixel of the
+**Source view (Ctrl+F3, needs `diagnostic_keys=1`).** For finding the cause of flicker. Every pixel of the
 high-resolution view gets half the colour of where it comes from:
 
 | Colour | Source |
@@ -239,7 +243,7 @@ high-resolution view gets half the colour of where it comes from:
 | orange | redrawn line (road) |
 | white | kept from the game's picture (aircraft, smoke, anything not recognised) |
 
-**Steady strip below the horizon (Ctrl+F2).** Just below its horizon the game
+**Steady strip below the horizon (Ctrl+F2, needs `diagnostic_keys=1`).** Just below its horizon the game
 itself changes its mind from frame to frame: a far field has a thin point one
 frame and not the next, a short road is drawn in one frame and not in the next.
 In a strip of 8 game pixels below the horizon, a pixel of the high-resolution
@@ -288,6 +292,8 @@ Limits of this first version:
 - `key_repeat_rate`, `key_repeat_delay`: the key repeat while a key is held.
   The defaults are 30 per second and 250 ms.
 - `show_fps`
+- `diagnostic_keys`: `0` (default) or `1`. Turns on the diagnostic keys
+  Ctrl+F2, Ctrl+F3 and Ctrl+F5.
 
 ## Building from source
 
