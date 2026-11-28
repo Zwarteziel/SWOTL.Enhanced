@@ -25,14 +25,14 @@ _Sound_
 - **AdLib music and sound effects.** The game's original AdLib sounds are emulated with Nuked-OPL3.
 
 _Controls_
-- **Gamepad and flight sticks** The game can use modern controllers and more traditional joysticks, also when used through a USB gameport adapter).
+- **Gamepad and flight sticks** Use modern controllers and more traditional joysticks, also through a USB gameport adapter.
 
-- **Keyboard flying** By default the arrow keys drive a smooth virtual joystick while you fly. With `keyboard_flight=classic` these settings are reset
+- **Keyboard flying** By default the arrow keys drive a smooth virtual joystick while you fly. Reset with `keyboard_flight=classic`
 
 _Gameplay_
-- **Speed** The title bar shows the game's speed (`speed`): emulated time against real time. At 100% the game runs exactly as fast as on a real PC.
+- **Speed** The title bar shows the game's speed (`speed`): emulated time against real time. At 100% the game runs as fast as on a real PC.
 
-- **Frame rate** The emulated CPU speed adapts to your PC. The flight model runs on the game's 237 Hz timer, so the framerate does not change how aircraft handle.
+- **Frame rate** The emulated CPU adapts to your PC. The flight model runs on the game's 237 Hz timer, so fps do not change how planes handle.
 
 - **Mouse** The mouse is captured when you click in the window.
 
