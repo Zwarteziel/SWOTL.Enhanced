@@ -13,50 +13,42 @@ joystick and mouse. SDL3 handles the window, scaling, sound and gamepads.
 
 ## What works
 
-- Intro, menus, campaign map, briefing and flight. The game was tested up to the
-  3D flight with cockpit and controls.
-- **Display.** Window or full screen, with the original 4:3 shape. Three scaling
-  styles: *sharp* (crisp pixels with smooth edges), *nearest* and *linear*.
-- **CRT shader.** By default the picture looks like a 1990s VGA monitor, with
-  the CRT shaders and colour emulation of DOSBox Staging 0.83 (`shader =
-  crt-auto`). See *CRT shader* below.
-- **Gamepad or flight stick as joystick.** Any gamepad, and any joystick that is
-  not a gamepad (a flight stick such as the CH Flightstick Pro, also through a
-  USB gameport adapter), with throttle lever and hat switch. The game's start-up
-  joystick calibration is answered automatically.
-- **AdLib music and sound effects.** Emulated with Nuked-OPL3.
-- **Mouse.** The mouse is captured when you click in the window.
-- **Speed.** The title bar shows the game's speed (`speed`): emulated time
-  against real time. At 100% the game runs exactly as fast as on a real PC. If your PC cannot
-  keep up, it drops below 100% and everything gets slower, the flying too.
-- **One clock.** The time of day the game sees (DOS and BIOS) comes from the
-  emulator's clock, started at the real time when the program starts. It runs
-  at the emulated speed, so everything the game times itself follows the
-  emulation, and seconds and hundredths always fit together.
-- **Frame rate.** The emulated CPU speed adapts to your PC. The title bar shows
-  the real 3D frame rate (`fps`; a dash outside the 3D view). It counts the game's own frame-present calls in the VGA
-  driver. At 10 MIPS it is about 16 fps, at 20 MIPS about 34 fps and at 40 MIPS
-  about 63 fps. The flight model runs on the game's 237 Hz timer, so the frame
-  rate does not change how the aircraft handle.
-- **Keyboard flying.** By default the arrow keys drive a smooth virtual
-  joystick while you fly. Held down, the stick reaches full deflection in 0.25 s;
-  released, it springs back to the centre in 0.12 s. Hold an arrow and the
-  aircraft keeps rolling, as in the original. With `keyboard_flight=classic` the
-  arrows go to the game as key presses, and every key repeat is one control
-  step. Held keys repeat 30 times per second after 250 ms. That is the fast
-  typematic setting of most 386/486 BIOSes and what DOSBox gives on Windows.
-  With the slow power-on default of the keyboard (10.9 per second after 500 ms),
-  the aircraft rolls about three times more slowly.
+_Graphics_
+- **Display** Window or full screen, with the original 4:3 aspect ratio. Three
+  scaling styles: *sharp* (crisp pixels with smooth edges), *nearest* and *linear*.
 
-- **Modified game copies.** Some copies of SWOTL have a modified
+- **High res mode** An experimental high-res mode renders the ground, roads,
+  rivers and objects in 1280x800 instead of 320x200. Janky, so off by default.
+
+- **CRT shader** By default the picture looks like a 1990s VGA monitor, with
+  the CRT shaders and colour emulation of DOSBox Staging 0.83
+
+
+_Sound_
+- **AdLib music and sound effects.** The game's original AdLib sounds are 
+   emulated with Nuked-OPL3.
+
+_Controls_
+- **Gamepad and flight sticks** The game can use modern controllers and more
+  traditional joysticks, also when used through a USB gameport adapter).
+
+- **Keyboard flying** By default the arrow keys drive a smooth virtual
+  joystick while you fly. With `keyboard_flight=classic` these settings are reset
+
+_Gameplay_
+- **Speed** The title bar shows the game's speed (`speed`): emulated time
+  against real time. At 100% the game runs exactly as fast as on a real PC.
+
+- **Frame rate** The emulated CPU speed adapts to your PC. The flight model runs
+  on the game's 237 Hz timer, so the framerate does not change how aircraft handle.
+
+- **Mouse** The mouse is captured when you click in the window.
+
+- **Modified game copies** Some copies of SWOTL have a modified
   `NOTCAMP.OVL` that only works when the program is loaded at certain memory
   addresses. SWOTL Enhanced loads the game at an address where it works, so you
   get the *Choose a side* screen and clean menu text, just as in DOSBox.
   Unmodified copies are not affected.
-
-The version number is shown in the title bar, at the top of
-`swotl-enhanced.ini` and in the file properties of the exe (right-click >
-Properties > Details).
 
 ## Installation
 
@@ -82,6 +74,7 @@ comments in the file are not carried over.
 | Ctrl+F9 | Show speed, frame rate and CPU speed in the picture (they are always in the title bar) |
 | Ctrl+F6 | CRT shader on/off (saved in the ini file) |
 | Ctrl+F4 | High-resolution 3D view on/off (experimental, saved in the ini file) |
+| Diagnostic keys |
 | Ctrl+F3 | Source view of the high-resolution 3D view on/off (diagnostic; see below) |
 | Ctrl+F2 | Steady strip below the horizon on/off (diagnostic; the strip is always on otherwise; see below) |
 | Ctrl+F7 / Ctrl+F8 | Make the gamepad stick less / more curved (saved in the ini file) |
