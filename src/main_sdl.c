@@ -46,7 +46,15 @@ typedef struct {
     char pad[32][32];    /* gamepad button mapping strings, by SDL_GamepadButton */
     char pad_lt[32], pad_rt[32];
     int rstick_views;
+    /* flight stick: any joystick that is not a gamepad */
+    char stk[12][32];    /* button1..button12 */
+    int stk_ax_x, stk_ax_y, stk_ax_thr, stk_ax_rud; /* axis numbers, -1 = not used */
+    int stk_thr_invert, stk_hat_views;
+    float stk_deadzone;
+    char stk_device[64]; /* part of the name of the stick to use; empty = first one, "none" = off */
 } Config;
+
+#define STK_BUTTONS 12
 
 static const char *pad_names[] = {
     "a", "b", "x", "y", "back", "guide", "start", "leftstick", "rightstick",
@@ -74,6 +82,13 @@ static void config_defaults(Config *cfg) {
     cfg->key_rate = 30;
     cfg->key_delay = 250;
     cfg->rstick_views = 1;
+    cfg->stk_ax_x = 0; cfg->stk_ax_y = 1; cfg->stk_ax_thr = 2; cfg->stk_ax_rud = -1;
+    cfg->stk_hat_views = 1;
+    cfg->stk_deadzone = 0.05f;
+    strcpy(cfg->stk[0], "joy1");
+    strcpy(cfg->stk[1], "joy2");
+    strcpy(cfg->stk[2], "ENTER");
+    strcpy(cfg->stk[3], "KP2/KP8");
     strcpy(cfg->pad[SDL_GAMEPAD_BUTTON_SOUTH], "joy1");
     strcpy(cfg->pad[SDL_GAMEPAD_BUTTON_EAST], "joy2");
     strcpy(cfg->pad[SDL_GAMEPAD_BUTTON_WEST], "ENTER");
@@ -135,8 +150,8 @@ static void config_write(const char *path, const Config *c) {
         "; Advanced flight controls: 0 or 1. The rudder (F5-F9, gamepad LB/RB or\n"
         "; lt/rt=RUDDER) only works with 1.\n"
         "advanced=%d\n"
-        "; Joystick: auto (on when a gamepad is connected at start, or with\n"
-        "; keyboard_flight=stick), on, off\n"
+        "; Joystick: auto (on when a gamepad or joystick is connected at start, or\n"
+        "; with keyboard_flight=stick), on, off\n"
         "joystick=%s\n"
         "; Music and sound: 1 (or adlib) = AdLib, sb = Sound Blaster, 0 = off.\n"
         "; SWOTL uses only the FM (AdLib) part of a Sound Blaster, so both sound the same.\n"
@@ -234,6 +249,32 @@ static void config_write(const char *path, const Config *c) {
         "; Deflection at full stick, 0.3 - 1.0 (lower = gentler maximum input)\n"
         "stick_range=%g\n",
         c->pad_lt, c->pad_rt, c->rstick_views, c->deadzone, c->stick_curve, c->stick_range);
+    fprintf(f,
+        "\n[joystick]\n"
+        "; A flight stick or any other joystick that is not a gamepad (for example a\n"
+        "; CH Flightstick Pro or a Thrustmaster stick). It works next to a gamepad.\n"
+        "; stick_curve and stick_range from [gamepad] apply to it too.\n"
+        "; Axes are numbered from 0 (the window shows how many a stick has when it is\n"
+        "; connected); -1 = not used.\n"
+        "; Which joystick: empty = the first one that is not a gamepad, or part of\n"
+        "; its name (e.g. device=CH), or device=none to use no joystick.\n"
+        "device=%s\n"
+        "axis_x=%d\n"
+        "axis_y=%d\n"
+        "; Throttle lever or wheel: sets the game's throttle (the + and - keys). The\n"
+        "; game's own throttle is left alone until you move the lever.\n"
+        "axis_throttle=%d\n"
+        "; 1 = full throttle at the other end of the lever\n"
+        "throttle_invert=%d\n"
+        "; Analog rudder (pedals or a twist grip; needs advanced=1)\n"
+        "axis_rudder=%d\n"
+        "deadzone=%g\n"
+        "; Hat switch looks around in flight (numeric keypad views): 0 or 1\n"
+        "hat_views=%d\n"
+        "; Buttons, numbered from 1. Same values as for the gamepad buttons. In menus\n"
+        "; button 1 and 2 click the mouse, as A and B on a gamepad.\n",
+        c->stk_device, c->stk_ax_x, c->stk_ax_y, c->stk_ax_thr, c->stk_thr_invert, c->stk_ax_rud, c->stk_deadzone, c->stk_hat_views);
+    for (int i = 0; i < STK_BUTTONS; i++) if (i < 6 || c->stk[i][0]) fprintf(f, "button%d=%s\n", i + 1, c->stk[i]);
     fclose(f);
 }
 
@@ -284,6 +325,16 @@ static void config_load(Config *cfg, const char *path) {
             else if (!strcmp(k, "stick_range")) cfg->stick_range = (float)atof(v);
             else if (!strcmp(k, "rightstick_views")) cfg->rstick_views = atoi(v);
             else for (int i = 0; pad_names[i]; i++) if (!strcmp(k, pad_names[i])) snprintf(cfg->pad[i], sizeof cfg->pad[i], "%s", v);
+        } else if (!strcmp(section, "joystick")) {
+            if (!strcmp(k, "device")) snprintf(cfg->stk_device, sizeof cfg->stk_device, "%s", v);
+            else if (!strcmp(k, "axis_x")) cfg->stk_ax_x = atoi(v);
+            else if (!strcmp(k, "axis_y")) cfg->stk_ax_y = atoi(v);
+            else if (!strcmp(k, "axis_throttle")) cfg->stk_ax_thr = *v ? atoi(v) : -1;
+            else if (!strcmp(k, "axis_rudder")) cfg->stk_ax_rud = *v ? atoi(v) : -1;
+            else if (!strcmp(k, "throttle_invert")) cfg->stk_thr_invert = atoi(v);
+            else if (!strcmp(k, "deadzone")) cfg->stk_deadzone = (float)atof(v);
+            else if (!strcmp(k, "hat_views")) cfg->stk_hat_views = atoi(v);
+            else if (!strncmp(k, "button", 6)) { int b = atoi(k + 6); if (b >= 1 && b <= STK_BUTTONS) snprintf(cfg->stk[b - 1], sizeof cfg->stk[b - 1], "%s", v); }
         }
     }
     fclose(f);
@@ -392,7 +443,15 @@ typedef struct {
     Action pad_act[32], lt_act, rt_act;
     int joy_buttons;
     uint8_t pad_route[32]; /* where a held pad button went: 0 none, 1 mouse, 2 its action */
-    int view_dir;          /* current right-stick view key */
+    int view_dir;          /* current view key (right stick or hat) */
+    int rs_view, hat_view; /* view asked for by the right stick / the hat, 0 = none */
+    SDL_Joystick *stick;   /* flight stick (a joystick that is not a gamepad) */
+    SDL_JoystickID stick_id;
+    Action stk_act[STK_BUTTONS];
+    uint8_t stk_route[STK_BUTTONS], stk_held[STK_BUTTONS];
+    float stk_x, stk_y; int stk_ok;
+    SDL_Joystick *cand[4]; int ncand; Uint64 cand_t0[4]; float cand_rest[4][8]; /* joysticks not moved yet */
+    float thr_lever; int thr_seen, thr_active, thr_wait, thr_expect, thr_open; double thr_next, thr_ref, thr_miss, thr_tap;
     double lt_next, rt_next;
     int lt_down, rt_down;
     int rudder_state;      /* rudder sent to the game: -2 hard left .. 0 centre .. 2 hard right */
@@ -680,9 +739,9 @@ static void rec_toggle(App *a) {
         fprintf(a->rec.log, "SWOTL Enhanced v" APP_VERSION " diagnostic recording\n");
         fprintf(a->rec.log, "args=%s renderer=%s video=%s shader=%s display=%s\n", a->args, a->gl ? crtgl_info(a->gl) : SDL_GetRendererName(a->ren), SDL_GetCurrentVideoDriver(),
                 shader_to_str(a->cfg.shader), a->shader_name ? a->shader_name : "-");
-        fprintf(a->rec.log, "keyboard_flight=%d ramp=%.3f return=%.3f key_rate=%.1f key_delay=%.0f mips=%.1f joystick_cfg=%d game_joy=%d pad=%s\n",
+        fprintf(a->rec.log, "keyboard_flight=%d ramp=%.3f return=%.3f key_rate=%.1f key_delay=%.0f mips=%.1f joystick_cfg=%d game_joy=%d pad=%s stick=%s\n",
                 a->cfg.kb_flight, a->cfg.kb_ramp, a->cfg.kb_return, a->cfg.key_rate, a->cfg.key_delay, a->cfg.mips, a->cfg.joystick, a->game_joy,
-                a->pad ? SDL_GetGamepadName(a->pad) : "none");
+                a->pad ? SDL_GetGamepadName(a->pad) : "none", a->stick ? SDL_GetJoystickName(a->stick) : "none");
         fprintf(a->rec.log, "frame real_ms emu_ms ips fps tempo in3d mouse kbLRUD kb_x kb_y pad_ok pad_x pad_y joy_x joy_y joy_btn joy_polls\n");
     }
     set_status(a, "Recording (Ctrl+F5 stops, max 60 s)");
@@ -900,6 +959,8 @@ static void pad_release_all(App *a) {
     for (int b = 0; b < 32; b++) if (a->pad_route[b]) pad_button(a, b, 0);
 }
 
+static const int view_keys[8] = {0x4D, 0x49, 0x4C, 0x47, 0x4B, 0x4F, 0x50, 0x51}; /* R, UR, up=KP5, UL, L, DL, D, DR */
+
 static void poll_gamepad(App *a, double now_ms) {
     a->pad_ok = 0;
     if (!a->pad) return;
@@ -924,21 +985,253 @@ static void poll_gamepad(App *a, double now_ms) {
     float rud = (a->rt_act.rudder ? rt : 0.0f) - (a->lt_act.rudder ? lt : 0.0f);
     if (a->lt_act.rudder || a->rt_act.rudder) update_rudder(a, rud, now_ms, menu);
     /* right stick: views */
+    a->rs_view = 0;
     if (a->cfg.rstick_views && !menu) {
         float rx = axis(a, SDL_GAMEPAD_AXIS_RIGHTX), ry = axis(a, SDL_GAMEPAD_AXIS_RIGHTY);
-        int dir = 0x48; /* KP8 forward */
         float mag = SDL_sqrtf(rx * rx + ry * ry);
         if (mag > 0.6f) {
             float ang = SDL_atan2f(-ry, rx) * 180.0f / SDL_PI_F; /* 0 = right, 90 = up */
             if (ang < 0) ang += 360;
-            static const int keys[8] = {0x4D, 0x49, 0x4C, 0x47, 0x4B, 0x4F, 0x50, 0x51}; /* R, UR, up=KP5, UL, L, DL, D, DR */
-            int sector = (int)((ang + 22.5f) / 45.0f) & 7;
-            dir = keys[sector];
+            a->rs_view = view_keys[(int)((ang + 22.5f) / 45.0f) & 7];
         }
-        if (dir != a->view_dir) {
-            if (a->view_dir) tap(a, 0, dir);
-            a->view_dir = dir;
+    }
+}
+
+/* The look-around view: the hat of a flight stick, else the right stick of
+ * a gamepad, else forward. A view key is only sent when the view changes. */
+static void update_view(App *a) {
+    int used = (a->pad && a->cfg.rstick_views) || (a->stick && a->cfg.stk_hat_views);
+    if (!used || !machine_in_3d(a->m)) return;
+    int dir = a->hat_view ? a->hat_view : (a->rs_view ? a->rs_view : 0x48); /* KP8 forward */
+    if (dir != a->view_dir) {
+        if (a->view_dir) tap(a, 0, dir);
+        a->view_dir = dir;
+    }
+}
+
+/* ------------------------------------------------------------------ flight stick */
+static void stick_release_all(App *a);
+
+static void use_stick(App *a, SDL_Joystick *j) {
+    a->stick = j;
+    a->stick_id = SDL_GetJoystickID(j);
+    a->thr_seen = a->thr_active = a->thr_open = 0;
+    memset(a->stk_held, 0, sizeof a->stk_held);
+    const char *name = SDL_GetJoystickName(j);
+    char msg[128];
+    snprintf(msg, sizeof msg, "Joystick: %s (%d axes, %d buttons, %d hats)", name ? name : "?",
+             SDL_GetNumJoystickAxes(j), SDL_GetNumJoystickButtons(j), SDL_GetNumJoystickHats(j));
+    set_status(a, msg);
+}
+
+/* Opens every joystick that is not a gamepad as a candidate. Some devices
+ * that are no flight stick at all (RGB controllers, virtual devices)
+ * present themselves as a joystick, sometimes with an axis stuck at one end,
+ * so the candidate that is moved first (or whose button is pressed) becomes
+ * the stick; until then none has any effect. */
+static void open_sticks(App *a) {
+    if (a->stick || !SDL_strcasecmp(a->cfg.stk_device, "none")) return;
+    int n = 0;
+    SDL_JoystickID *ids = SDL_GetJoysticks(&n);
+    for (int i = 0; ids && i < n && a->ncand < 4; i++) {
+        if (SDL_IsGamepad(ids[i])) continue; /* gamepads have their own layout */
+        int known = 0;
+        for (int c = 0; c < a->ncand; c++) if (SDL_GetJoystickID(a->cand[c]) == ids[i]) known = 1;
+        if (known) continue;
+        const char *nm = SDL_GetJoystickNameForID(ids[i]);
+        if (a->cfg.stk_device[0] && (!nm || !SDL_strcasestr(nm, a->cfg.stk_device))) continue;
+        SDL_Joystick *j = SDL_OpenJoystick(ids[i]);
+        if (!j) continue;
+        if (SDL_GetNumJoystickAxes(j) < 2) { SDL_CloseJoystick(j); continue; }
+        a->cand[a->ncand] = j;
+        a->cand_t0[a->ncand] = SDL_GetTicks();
+        a->ncand++;
+    }
+    SDL_free(ids);
+    if (a->ncand == 1) {
+        char msg[128];
+        snprintf(msg, sizeof msg, "Joystick found: %s", SDL_GetJoystickName(a->cand[0]) ? SDL_GetJoystickName(a->cand[0]) : "?");
+        set_status(a, msg);
+    }
+}
+
+static void close_stick(App *a, SDL_JoystickID which) {
+    if (a->stick && which == a->stick_id) {
+        stick_release_all(a);
+        SDL_CloseJoystick(a->stick); a->stick = NULL;
+        set_status(a, "Joystick disconnected");
+        open_sticks(a);
+        return;
+    }
+    for (int c = 0; c < a->ncand; c++)
+        if (SDL_GetJoystickID(a->cand[c]) == which) {
+            SDL_CloseJoystick(a->cand[c]);
+            a->cand[c] = a->cand[--a->ncand];
+            a->cand_t0[c] = a->cand_t0[a->ncand];
+            return;
         }
+}
+
+/* the first candidate that is moved or whose button is pressed */
+static void choose_stick(App *a) {
+    Uint64 now = SDL_GetTicks();
+    for (int c = 0; c < a->ncand; c++) {
+        SDL_Joystick *j = a->cand[c];
+        int na = SDL_GetNumJoystickAxes(j); if (na > 8) na = 8;
+        int rest = now - a->cand_t0[c] < 300, moved = 0;
+        for (int i = 0; i < na; i++) {
+            float v = SDL_GetJoystickAxis(j, i) / 32767.0f;
+            if (rest) a->cand_rest[c][i] = v; /* rest position */
+            else if (SDL_fabsf(v - a->cand_rest[c][i]) > 0.15f) moved = 1;
+        }
+        if (rest) continue;
+        int nb = SDL_GetNumJoystickButtons(j);
+        for (int b = 0; b < nb && b < STK_BUTTONS; b++) if (SDL_GetJoystickButton(j, b)) moved = 1;
+        if (moved) {
+            for (int o = 0; o < a->ncand; o++) if (o != c) SDL_CloseJoystick(a->cand[o]);
+            a->ncand = 0;
+            use_stick(a, j);
+            int t = a->cfg.stk_ax_thr;
+            if (t >= 0 && t < na) {
+                /* the lever's rest position, so that the move that chose this stick counts */
+                float v = a->cfg.stk_thr_invert ? -a->cand_rest[c][t] : a->cand_rest[c][t];
+                a->thr_lever = (1.0f - v) * 0.5f; a->thr_ref = a->thr_lever; a->thr_seen = 1;
+            }
+            return;
+        }
+    }
+}
+
+/* an axis of the flight stick, -1..1, or 0 when it does not exist */
+static float stk_axis_raw(App *a, int ax) {
+    if (ax < 0 || ax >= SDL_GetNumJoystickAxes(a->stick)) return 0;
+    float v = SDL_GetJoystickAxis(a->stick, ax) / 32767.0f;
+    return v > 1 ? 1 : (v < -1 ? -1 : v);
+}
+static float stk_axis(App *a, int ax) {
+    float v = stk_axis_raw(a, ax), dz = a->cfg.stk_deadzone;
+    if (SDL_fabsf(v) < dz) return 0;
+    return (v > 0 ? 1 : -1) * (SDL_fabsf(v) - dz) / (1 - dz);
+}
+
+/* Buttons 1 and 2 click the mouse in menus, as A and B on a gamepad; a
+ * release goes where the press went. */
+static void stick_button(App *a, int b, int down) {
+    int route;
+    if (down) {
+        if (a->stk_route[b]) return;
+        route = (!machine_in_3d(a->m) && b < 2) ? 1 : 2;
+        a->stk_route[b] = (uint8_t)route;
+    } else {
+        route = a->stk_route[b];
+        a->stk_route[b] = 0;
+        if (!route) return;
+    }
+    if (route == 1) {
+        int bit = b == 0 ? 1 : 2, mb = a->m->mouse_buttons;
+        if (down) mb |= bit; else mb &= ~bit;
+        machine_mouse_buttons(a->m, mb);
+    } else {
+        int k = a->stk_act[b].key;
+        if (down && k >= 0x3F && k <= 0x43 && machine_in_3d(a->m)) rudder_hint(a);
+        do_action(a, &a->stk_act[b], down);
+    }
+}
+
+static void stick_release_all(App *a) {
+    for (int b = 0; b < STK_BUTTONS; b++) { if (a->stk_route[b]) stick_button(a, b, 0); a->stk_held[b] = 0; }
+}
+
+/* The throttle lever sets the game's throttle with the + and - keys (keypad),
+ * one step of 8 out of 255 per press. The game's throttle is read back, and
+ * new presses are only sent once the previous ones have arrived, so the
+ * throttle never overshoots. Should the game's throttle not be found, the lever's
+ * movement is sent as key presses instead. Nothing happens until the lever is
+ * moved, so the game's own throttle at the start of a flight, and the + and -
+ * keys, keep working. */
+static void stick_throttle(App *a, double now_ms) {
+    float v = stk_axis_raw(a, a->cfg.stk_ax_thr);
+    if (a->cfg.stk_thr_invert) v = -v;
+    float lever = (1.0f - v) * 0.5f; /* 0 = idle, 1 = full; most levers give -1 when pushed forward */
+    if (!a->thr_seen) { a->thr_lever = lever; a->thr_ref = lever; a->thr_seen = 1; a->thr_active = 0; return; }
+    if (SDL_fabsf(lever - a->thr_lever) > 0.02f) {
+        a->thr_lever = lever;
+        if (!a->thr_active) { a->thr_active = 1; a->thr_wait = -1; }
+    }
+    if (!a->thr_active || now_ms < a->thr_next) return;
+    int target = (int)(lever * 255.0f + 0.5f);
+    int cur = a->thr_open ? -1 : machine_throttle(a->m);
+    if (cur >= 0) {
+        a->thr_miss = 0;
+        if (a->thr_wait >= 0 && cur != a->thr_expect && now_ms < a->thr_tap + 400.0) return; /* keys still on their way */
+        if (a->thr_wait >= 0 && cur == a->thr_wait) {
+            /* not one of the key presses arrived: work without reading the
+             * game's throttle back */
+            a->thr_open = 1; a->thr_ref = cur / 255.0;
+            return;
+        }
+        int d = target - cur;
+        if (d > -6 && d < 6) { a->thr_active = 0; a->thr_wait = -1; return; }
+        /* up to four presses at a time, then wait until they have arrived */
+        int n = (d > 0 ? d : -d) / 8; if (n < 1) n = 1; if (n > 4) n = 4;
+        for (int i = 0; i < n; i++) tap(a, 0, d > 0 ? 0x4E : 0x4A);
+        int e = cur + (d > 0 ? 8 : -8) * n;
+        a->thr_expect = e < 0 ? 0 : (e > 255 ? 255 : e);
+        a->thr_wait = cur;
+        a->thr_tap = now_ms;
+        a->thr_next = now_ms + 30.0;
+        return;
+    }
+    if (!a->thr_open) {
+        /* the game's throttle is not (yet) found: give it a second */
+        if (a->thr_miss <= 0) a->thr_miss = now_ms;
+        if (now_ms - a->thr_miss < 1000.0) return;
+        a->thr_open = 1;
+    }
+    /* open loop: one key press per 8/255 of lever travel; at the ends of the
+     * lever a few presses more, so the game surely reaches idle or full */
+    double step = 8.0 / 255.0;
+    int end = lever > 0.98f ? 1 : (lever < 0.02f ? -1 : 0);
+    double want = end > 0 ? 1.25 : (end < 0 ? -0.25 : lever);
+    double diff = want - a->thr_ref;
+    if (diff >= step) { tap(a, 0, 0x4E); a->thr_ref += step; }
+    else if (diff <= -step) { tap(a, 0, 0x4A); a->thr_ref -= step; }
+    else { if (end) a->thr_ref = lever; a->thr_active = 0; return; }
+    a->thr_next = now_ms + 70.0; /* about one press per frame of the game */
+}
+
+static void poll_stick(App *a, double now_ms) {
+    a->stk_ok = 0; a->hat_view = 0;
+    if (!a->stick) choose_stick(a);
+    if (!a->stick) return;
+    int menu = !machine_in_3d(a->m);
+    float x = stk_axis(a, a->cfg.stk_ax_x), y = stk_axis(a, a->cfg.stk_ax_y);
+    if (menu) {
+        a->mouse_fx += x * 4.0f; a->mouse_fy += y * 3.0f;
+        int dx = (int)a->mouse_fx, dy = (int)a->mouse_fy;
+        a->mouse_fx -= dx; a->mouse_fy -= dy;
+        if (dx || dy) machine_mouse_move(a->m, dx, dy);
+    } else {
+        stick_shape(a, &x, &y);
+        a->stk_x = x; a->stk_y = y; a->stk_ok = 1;
+    }
+    int nb = SDL_GetNumJoystickButtons(a->stick);
+    for (int b = 0; b < STK_BUTTONS && b < nb; b++) {
+        int d = SDL_GetJoystickButton(a->stick, b) ? 1 : 0;
+        if (d != a->stk_held[b]) { a->stk_held[b] = (uint8_t)d; stick_button(a, b, d); }
+    }
+    if (a->cfg.stk_ax_thr >= 0 && a->cfg.stk_ax_thr < SDL_GetNumJoystickAxes(a->stick)) {
+        if (menu) { a->thr_seen = a->thr_open = 0; a->thr_miss = 0; } /* a new flight starts at the game's own throttle */
+        else stick_throttle(a, now_ms);
+    }
+    if (a->cfg.stk_ax_rud >= 0) update_rudder(a, stk_axis(a, a->cfg.stk_ax_rud), now_ms, menu);
+    if (a->cfg.stk_hat_views && !menu && SDL_GetNumJoystickHats(a->stick) > 0) {
+        static const int hat_keys[16] = {
+            0,    /* centred */      0x4C, /* up: KP5 */  0x4D, /* right */ 0x49, /* up-right */
+            0x50, /* down: KP2 */    0,                   0x51, /* down-right */ 0,
+            0x4B, /* left */         0x47, /* up-left */  0,    0,
+            0x4F, /* down-left */    0, 0, 0};
+        a->hat_view = hat_keys[SDL_GetJoystickHat(a->stick, 0) & 15];
     }
 }
 
@@ -959,6 +1252,7 @@ static void update_stick(App *a, double dt) {
     }
     float x = a->kb_x, y = a->kb_y;
     if (a->pad_ok) { x += a->pad_x; y += a->pad_y; }
+    if (a->stk_ok) { x += a->stk_x; y += a->stk_y; }
     if (x > 1) x = 1; if (x < -1) x = -1;
     if (y > 1) y = 1; if (y < -1) y = -1;
     if (!machine_in_3d(a->m)) { x = 0; y = 0; }
@@ -1092,9 +1386,11 @@ int main(int argc, char **argv) {
     for (int i = 0; pad_names[i]; i++) a->pad_act[i] = parse_action(a->cfg.pad[i]);
     a->lt_act = parse_action(a->cfg.pad_lt);
     a->rt_act = parse_action(a->cfg.pad_rt);
+    for (int i = 0; i < STK_BUTTONS; i++) a->stk_act[i] = parse_action(a->cfg.stk[i]);
     open_first_pad(a);
+    open_sticks(a);
 
-    build_args(a, a->args, sizeof a->args, a->pad != NULL);
+    build_args(a, a->args, sizeof a->args, a->pad != NULL || a->ncand > 0);
     a->m = machine_create(a->cfg.gamedir, "SWOTL.EXE", a->args);
     if (!a->m) { SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, APP_NAME, "Could not start SWOTL.EXE", NULL); return 1; }
     a->m->ips = a->cfg.mips;
@@ -1290,6 +1586,8 @@ int main(int argc, char **argv) {
                 break;
             }
             case SDL_EVENT_GAMEPAD_ADDED: open_first_pad(a); break;
+            case SDL_EVENT_JOYSTICK_ADDED: open_sticks(a); break;
+            case SDL_EVENT_JOYSTICK_REMOVED: close_stick(a, e.jdevice.which); break;
             case SDL_EVENT_GAMEPAD_REMOVED:
                 if (a->pad && SDL_GetGamepadID(a->pad) == e.gdevice.which) { pad_release_all(a); SDL_CloseGamepad(a->pad); a->pad = NULL; set_status(a, "Gamepad disconnected"); open_first_pad(a); }
                 break;
@@ -1307,6 +1605,8 @@ int main(int argc, char **argv) {
         last = now;
         if (dt > 0.25) dt = 0.25; /* catch up after slow frames; skip only real stalls */
         poll_gamepad(a, now * 1000.0 / freq);
+        poll_stick(a, now * 1000.0 / freq);
+        update_view(a);
         update_stick(a, dt);
         Uint64 t0 = SDL_GetPerformanceCounter();
         machine_run(a->m, dt * 1e6);

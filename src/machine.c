@@ -679,6 +679,30 @@ int machine_in_3d(Machine *m) {
     return m->frames_seen > 0 && m->time_us - m->last_frame_us < 500000.0;
 }
 
+/* SWOTL keeps the throttle of each engine as a word at DS:6BC0 + plane*8 +
+ * engine*2 (the high byte counts in steps of 8 per key press, 0-255), and the
+ * player's plane number at DS:BA22. The code that clears the throttles at
+ * the start of a flight identifies the code segment; the data segment is the
+ * one the game runs with in that code. */
+int machine_throttle(Machine *m) {
+    static const uint8_t sig[] = {0xC7, 0x87, 0xC0, 0x6B, 0x00, 0x00, 0x8B, 0xDE, 0xD1, 0xE3, 0xD1, 0xE3, 0xC6, 0x81, 0xF8, 0x80, 0x00};
+    if (!machine_in_3d(m)) return -1;
+    if (m->thr_cs && memcmp(m->mem + ((uint32_t)m->thr_cs << 4) + 0xD95A, sig, sizeof sig)) m->thr_cs = m->thr_ds = 0;
+    if (!m->thr_cs) {
+        if (m->time_us - m->thr_scan_us < 2e6 && m->thr_scan_us > 0) return -1;
+        m->thr_scan_us = m->time_us;
+        for (uint32_t seg = 0x100; seg < 0x9000; seg++)
+            if (!memcmp(m->mem + ((uint32_t)seg << 4) + 0xD95A, sig, sizeof sig)) { m->thr_cs = (uint16_t)seg; break; }
+        if (!m->thr_cs) return -1;
+    }
+    if (m->cpu.s[CS] == m->thr_cs && m->cpu.s[DS] == m->cpu.s[SS]) m->thr_ds = m->cpu.s[DS]; /* DGROUP */
+    if (!m->thr_ds) return -1;
+    uint32_t ds = (uint32_t)m->thr_ds << 4;
+    unsigned plane = m->mem[ds + 0xBA22] | m->mem[ds + 0xBA23] << 8;
+    if (plane >= 64) return -1;
+    return m->mem[ds + 0x6BC1 + plane * 8];
+}
+
 /* ------------------------------------------------------------------ create */
 static const uint8_t vga_default_16[16][3] = {
     {0,0,0},{0,0,42},{0,42,0},{0,42,42},{42,0,0},{42,0,42},{42,21,0},{42,42,42},

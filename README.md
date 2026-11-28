@@ -1,6 +1,6 @@
 # SWOTL Enhanced
 
-Version 0.1.34
+Version 0.1.35
 
 Run **Secret Weapons of the Luftwaffe** (Lucasfilm Games, 1991) on modern Windows
 without installing DOSBox. You need your own copy of the original game files.
@@ -20,8 +20,10 @@ joystick and mouse. SDL3 handles the window, scaling, sound and gamepads.
 - **CRT shader.** By default the picture looks like a 1990s VGA monitor, with
   the CRT shaders and colour emulation of DOSBox Staging 0.83 (`shader =
   crt-auto`). See *CRT shader* below.
-- **Gamepad as joystick.** The game's start-up joystick calibration is answered
-  automatically.
+- **Gamepad or flight stick as joystick.** Any gamepad, and any joystick that is
+  not a gamepad (a flight stick such as the CH Flightstick Pro, also through a
+  USB gameport adapter), with throttle lever and hat switch. The game's start-up
+  joystick calibration is answered automatically.
 - **AdLib music and sound effects.** Emulated with Nuked-OPL3.
 - **Mouse.** The mouse is captured when you click in the window.
 - **Speed.** The title bar shows the game's speed (`speed`): emulated time
@@ -129,6 +131,47 @@ corner of the picture shows the input state. A `.log` file next to it lists, for
 each frame, the timing (speed, fps, CPU speed), the keys and the stick values
 sent to the game. A recording of 20 seconds is about 115 MB.
 
+## Flight sticks
+
+A joystick that is not a gamepad, such as a CH Flightstick Pro or a Thrustmaster
+stick (USB, or an old gameport stick through a USB gameport adapter), works as
+the game's joystick, next to a gamepad if you have one. Connect it before you
+start SWOTL Enhanced, so that the game is started with its joystick on.
+
+| Flight stick | Game |
+|---|---|
+| Stick | Joystick (in menus: mouse pointer) |
+| Button 1 (trigger) | Fire button 1 (in menus: click) |
+| Button 2 | Fire button 2 |
+| Button 3 | Enter (drop bombs / rockets) |
+| Button 4 (hold) | Look back |
+| Hat switch | Look around (keypad views) |
+| Throttle lever or wheel | Throttle |
+
+**Calibration.** The joystick is calibrated automatically; you do not need
+Alt+C. The game's own calibration (Alt+C) still works.
+
+**Which stick.** Some devices that are no flight stick at all (RGB lighting
+controllers, virtual devices) also present themselves as a joystick. The stick
+you move first, or whose button you press first, is the one that is used. The
+window then shows its name and how many axes, buttons and hats it has.
+`device=` in `[joystick]` picks a stick by part of its name, and `device=none`
+turns this off.
+
+**Throttle.** The game only has throttle keys (+ and -, 32 steps from idle to
+full). SWOTL Enhanced reads the game's throttle and presses + or - until it
+matches the lever, so lever and game never run apart. At the start of a flight
+the game's own throttle stays as it is until you move the lever, and the
+throttle keys keep working. If the throttle works the wrong way round, set
+`throttle_invert=1`; if your stick has no throttle, or it is on another axis,
+change `axis_throttle`.
+
+The `[joystick]` section of the ini file sets the axes (`axis_x`, `axis_y`,
+`axis_throttle`, `axis_rudder` for pedals or a twist grip), the dead zone, the
+hat (`hat_views`) and the buttons (`button1` to `button12`, the same values as
+the gamepad buttons). `stick_curve` and `stick_range` apply to the flight stick
+too.
+
 ## CRT shader
 
 SWOTL Enhanced uses the CRT shaders of DOSBox Staging 0.83.0 and chooses
@@ -212,7 +255,7 @@ Limits of this first version:
 - `detail`: ground detail, 1 to 5.
 - `advanced`: advanced flight controls (rudder).
 - `joystick`: `auto`, `on` or `off`. With `auto`, the game's joystick is on
-  when a gamepad is connected or `keyboard_flight=stick`. With `off`, the arrow
+  when a gamepad or joystick is connected or `keyboard_flight=stick`. With `off`, the arrow
   keys always work as classic keys.
 - `sound`: `1`/`adlib`, `sb` or `0`. SWOTL only uses the FM (AdLib) part of a
   Sound Blaster: with the SB setting it writes to the same OPL2 ports and uses

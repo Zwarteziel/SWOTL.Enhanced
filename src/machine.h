@@ -113,6 +113,7 @@ typedef struct Machine {
     uint64_t stat_3da, stat_dac;
     double sig_scan_us;      /* last search for the frame-present routine */
     uint64_t frames_seen; double last_frame_us;
+    uint16_t thr_cs, thr_ds; double thr_scan_us; /* where the game keeps its throttles */
 
     /* BIOS-style key repeat (typematic) for the most recently pressed key */
     int typ_code;            /* scancode | 0x100 for E0 keys, 0 = none */
@@ -156,6 +157,9 @@ uint64_t machine_frames(Machine *m);
  * 3D frame in the last half second. The game also polls the mouse in flight
  * (mouse flying), so mouse polling cannot tell menus from flight. */
 int machine_in_3d(Machine *m);
+/* the player's throttle as the game holds it, 0-255 (one key press is 8), or
+ * -1 when not in flight or not found */
+int machine_throttle(Machine *m);
 
 /* Experimental high-resolution 3D view: on/off. */
 void machine_set_hires(Machine *m, int on);
