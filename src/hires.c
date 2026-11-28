@@ -46,6 +46,10 @@ typedef struct {
     HItem items[MAX_ITEMS]; int ni;
     uint8_t buf[320 * VIEW_MAX];
     int vh;              /* rows of the 3D view */
+    /* width of the 3D view ([2583]: 320 for the forward and side views, less
+     * for the rear, up and shoulder views; the buffer has this stride), and
+     * where the game puts it on the screen ([257F]) */
+    int vw, sx, sy;
     float bot;           /* buffer row = bot - y */
     double time_us;
     uint64_t serial;
@@ -122,7 +126,8 @@ struct Hires {
     uint8_t pwmap[320 * VIEW_MAX], vacc[320 * VIEW_MAX];
     /* pixels where the screen has differed from the 3D frame (cockpit) */
     uint8_t nonview[320 * VIEW_MAX];
-    int vacc_vh, pw_rows;
+    int vacc_vh, vacc_vw, vacc_off, pw_rows;
+    int vw;              /* width of the 3D view while capturing ([2583]) */
     uint16_t wseg; int wrows;
     /* the line or polygon being drawn: its region of the buffer before */
     int line_item, lx0, lx1, ly0, ly1; uint16_t lseg; int lrows;
@@ -411,7 +416,8 @@ static void region_start(Hires *h, Machine *m, uint32_t ds, HFrame *f, int item)
     uint16_t bseg = rw(mem, ds + 0x2579);
     int rows = (int16_t)rw(mem, ds + 0x2591);
     float bot = (int16_t)rw(mem, ds + 0x2593) + 1.5f;
-    if (rows <= 0 || rows > VIEW_MAX || !bseg || ((uint32_t)bseg << 4) + 320u * rows > 0xA0000) return;
+    const int W = h->vw;
+    if (rows <= 0 || rows > VIEW_MAX || W * rows > 320 * VIEW_MAX || !bseg || ((uint32_t)bseg << 4) + (uint32_t)W * rows > 0xA0000) return;
     const HItem *it = &f->items[item];
     float fx0 = 1e9f, fx1 = -1e9f, fy0 = 1e9f, fy1 = -1e9f;
     for (int i = 0; i < it->n; i++) {
@@ -419,17 +425,17 @@ static void region_start(Hires *h, Machine *m, uint32_t ds, HFrame *f, int item)
         fx0 = fminf(fx0, v->x); fx1 = fmaxf(fx1, v->x);
         fy0 = fminf(fy0, bot - v->y); fy1 = fmaxf(fy1, bot - v->y);
     }
-    int x0 = fx0 < 1 ? 0 : (int)fx0 - 1, x1 = fx1 > 318 ? 319 : (int)fx1 + 1;
+    int x0 = fx0 < 1 ? 0 : (int)fx0 - 1, x1 = fx1 > W - 2 ? W - 1 : (int)fx1 + 1;
     int y0 = fy0 < 1 ? 0 : (int)fy0 - 1, y1 = fy1 > rows - 2 ? rows - 1 : (int)fy1 + 1;
     h->line_item = item; h->lseg = bseg; h->lrows = rows;
     h->lx0 = x0; h->lx1 = x1; h->ly0 = y0; h->ly1 = y1;
     if (x0 > x1 || y0 > y1) return;
     /* let the CPU mark every byte written in these rows */
-    uint32_t len = 320u * (uint32_t)(y1 - y0 + 1);
+    uint32_t len = (uint32_t)W * (uint32_t)(y1 - y0 + 1);
     memset(h->wmap, 0, len);
     m->cpu.wt_map = h->wmap;
     m->cpu.wt_tag = NULL;
-    m->cpu.wt_lo = ((uint32_t)bseg << 4) + 320u * (uint32_t)y0;
+    m->cpu.wt_lo = ((uint32_t)bseg << 4) + (uint32_t)W * (uint32_t)y0;
     m->cpu.wt_len = len;
 }
 
@@ -451,8 +457,8 @@ static void region_end(Hires *h, Machine *m, uint32_t ds, HFrame *f) {
         const uint8_t *buf = m->mem + ((uint32_t)h->lseg << 4);
         for (int y = h->ly0; y <= h->ly1; y++)
             for (int x = h->lx0; x <= h->lx1; x++) {
-                int i = y * 320 + x;
-                if (!h->wmap[(y - h->ly0) * 320 + x]) continue;
+                int i = y * h->vw + x;
+                if (!h->wmap[(y - h->ly0) * h->vw + x]) continue;
                 cnt++;
                 f->lmask[i] = 1;
                 f->lval[i] = buf[i];
@@ -475,9 +481,9 @@ static void region_end(Hires *h, Machine *m, uint32_t ds, HFrame *f) {
 /* The position along a scanline: the projection turns the picture, so it is
  * the screen x or the row, either way round (by orientation; measured). */
 static const float ORIENT_U[8][3] = {
-    {1, 0, 0}, {1, 0, 0}, {-1, 0, 320}, {-1, 0, 320},
-    {0, -1, 104}, {0, 1, 0}, {0, -1, 104}, {0, 1, 0},
-};
+    {1, 0, 0}, {1, 0, 0}, {-1, 0, 1}, {-1, 0, 1},
+    {0, -1, 2}, {0, 1, 0}, {0, -1, 2}, {0, 1, 0},
+}; /* constant: 1 = the view's width, 2 = its height */
 /* the scanline v of a pixel centre is floor(v) for the continuous v */
 #define V_OFF 1.5f
 
@@ -485,10 +491,11 @@ static const float ORIENT_U[8][3] = {
  * Scanlines that cover far more pixels than the others are the renderer
  * filling the rest of the view at once; those are left out. */
 static void fit_ground(Hires *h, HItem *it, int rows) {
+    const int W = h->vw;
     static int cnt[1024];
     memset(cnt, 0, sizeof cnt);
     int n = 0;
-    for (int i = 0; i < 320 * rows; i++)
+    for (int i = 0; i < W * rows; i++)
         if (h->wmap[i] && h->wtag[i] < 1024) { cnt[h->wtag[i]]++; n++; }
     if (n < 200) return;
     /* typical pixels per scanline: the 75th percentile of the counts */
@@ -501,9 +508,9 @@ static void fit_ground(Hires *h, HItem *it, int rows) {
     for (int pass = 0; pass < 3; pass++) {
         double s[3][3] = {{0}}, r[3] = {0};
         int k = 0;
-        for (int i = 0; i < 320 * rows; i++) {
+        for (int i = 0; i < W * rows; i++) {
             if (!h->wmap[i] || h->wtag[i] >= 1024 || cnt[h->wtag[i]] > lim) continue;
-            double X = i % 320 + 0.5, R = i / 320 + 0.5, v = h->wtag[i], q[3] = {X, R, 1};
+            double X = i % W + 0.5, R = i / W + 0.5, v = h->wtag[i], q[3] = {X, R, 1};
             if (pass && fabs(p[0] * X + p[1] * R + p[2] - v) > lim_res) continue;
             for (int a = 0; a < 3; a++) { r[a] += q[a] * v; for (int b = 0; b < 3; b++) s[a][b] += q[a] * q[b]; }
             k++;
@@ -522,15 +529,15 @@ static void fit_ground(Hires *h, HItem *it, int rows) {
     }
     /* check: nearly all pixels within one scanline of the fit */
     int ok = 0, all = 0;
-    for (int i = 0; i < 320 * rows; i++) {
+    for (int i = 0; i < W * rows; i++) {
         if (!h->wmap[i] || h->wtag[i] >= 1024 || cnt[h->wtag[i]] > lim) continue;
         all++;
-        ok += fabs(p[0] * (i % 320 + 0.5) + p[1] * (i / 320 + 0.5) + p[2] - h->wtag[i]) <= 1.0;
+        ok += fabs(p[0] * (i % W + 0.5) + p[1] * (i / W + 0.5) + p[2] - h->wtag[i]) <= 1.0;
     }
     if (dbg_on()) fprintf(stderr, "[hires] ground fit orient %d: v = %.4f x + %.4f row + %.2f, %d px, %.1f%% within 1\n", it->orient, p[0], p[1], p[2], all, all ? 100.0 * ok / all : 0);
     if (!all || ok < all * 0.95) return;
     const float *u = ORIENT_U[it->orient];
-    it->m[0] = u[0]; it->m[1] = u[1]; it->m[2] = u[2];
+    it->m[0] = u[0]; it->m[1] = u[1]; it->m[2] = u[2] == 1 ? (float)W : (u[2] == 2 ? (float)rows : 0.f);
     it->m[3] = (float)p[0]; it->m[4] = (float)p[1]; it->m[5] = (float)p[2] + V_OFF;
     it->col = 0;
     memcpy(h->lastm, it->m, sizeof h->lastm);
@@ -544,6 +551,11 @@ void hires_breakpoint(Hires *h, Machine *m, CPU *c) {
     uint16_t sp = c->r[SP];
     h->ds = c->s[DS];
     m->cpu.sh_lo = ds; m->cpu.sh_len = 0x10000;
+    {
+        int w = (int16_t)rw(mem, ds + 0x2583);
+        h->vw = w >= 16 && w <= 320 ? w : 320;
+        if (f->vw != h->vw) { if (f->ni || f->ne || f->nv) f->vw = -1; else f->vw = h->vw; } /* changed within the frame: not used */
+    }
     switch (c->ip) {
     case 0x663F: case 0x8A8B: case 0x8C6B:
         rerun_projection(h, m, c);
@@ -625,9 +637,10 @@ void hires_breakpoint(Hires *h, Machine *m, CPU *c) {
         int rows = (int16_t)rw(mem, ds + 0x2591);
         uint16_t bseg = rw(mem, ds + 0x2579);
         h->wrows = 0;
-        if (rows > 0 && rows <= VIEW_MAX && bseg && ((uint32_t)bseg << 4) + 320u * rows <= 0xA0000) {
-            memset(h->wmap, 0, 320u * rows);
-            c->wt_map = h->wmap; c->wt_lo = (uint32_t)bseg << 4; c->wt_len = 320u * rows;
+        uint32_t wlen = (uint32_t)h->vw * rows;
+        if (rows > 0 && rows <= VIEW_MAX && wlen <= 320u * VIEW_MAX && bseg && ((uint32_t)bseg << 4) + wlen <= 0xA0000) {
+            memset(h->wmap, 0, wlen);
+            c->wt_map = h->wmap; c->wt_lo = (uint32_t)bseg << 4; c->wt_len = wlen;
             c->wt_tag = h->wtag; c->wt_tag_src = ds + 0x23FF;
             h->wseg = bseg; h->wrows = rows;
         }
@@ -640,7 +653,7 @@ void hires_breakpoint(Hires *h, Machine *m, CPU *c) {
         if (!rows) break;
         const uint8_t *b = mem + ((uint32_t)h->wseg << 4);
         if (f->gseg != h->wseg) { memset(f->gmask, 0, sizeof f->gmask); f->gseg = h->wseg; }
-        for (int i = 0; i < 320 * rows; i++) if (h->wmap[i]) { f->gmask[i] = 1; f->gval[i] = b[i]; }
+        for (int i = 0; i < h->vw * rows; i++) if (h->wmap[i]) { f->gmask[i] = 1; f->gval[i] = b[i]; }
         if (h->gitem >= 0 && h->gitem < f->ni) fit_ground(h, &f->items[h->gitem], rows);
         h->gitem = -1;
         break;
@@ -728,13 +741,19 @@ void hires_present(Hires *h, Machine *m, CPU *c) {
     int vh = h->ds ? (int16_t)rw(m->mem, ds + 0x2591) : 0;
     int bot = h->ds ? (int16_t)rw(m->mem, ds + 0x2593) : 0;
     int vw = h->ds ? (int16_t)rw(m->mem, ds + 0x2583) : 0;
+    /* the present routine copies the view to the screen at [257F] */
+    int off = h->ds ? rw(m->mem, ds + 0x257F) : 0, sx = off % 320, sy = off / 320;
+    int vok = vw >= 16 && vw <= 320 && vh > 8 && vh <= VIEW_MAX && sx + vw <= 320 && sy + vh <= 200;
     /* watch which screen pixels this present call writes */
-    if (vw != 320 || vh != h->vacc_vh) { memset(h->vacc, 0, sizeof h->vacc); memset(h->nonview, 0, sizeof h->nonview); h->vacc_vh = vh; }
+    if (vw != h->vacc_vw || vh != h->vacc_vh || off != h->vacc_off) {
+        memset(h->vacc, 0, sizeof h->vacc); memset(h->nonview, 0, sizeof h->nonview);
+        h->vacc_vh = vh; h->vacc_vw = vw; h->vacc_off = off;
+    }
     h->pw_rows = 0;
-    if (h->found > 0 && vw == 320 && vh > 8 && vh <= VIEW_MAX && !c->wt_len) {
+    if (h->found > 0 && vok && !c->wt_len) {
         uint32_t sp = ss + c->r[SP];
         memset(h->pwmap, 0, 320u * vh);
-        c->wt_map = h->pwmap; c->wt_tag = NULL; c->wt_lo = 0xA0000; c->wt_len = 320u * vh;
+        c->wt_map = h->pwmap; c->wt_tag = NULL; c->wt_lo = 0xA0000 + (uint32_t)off; c->wt_len = 320u * vh;
         c->ret_lin = ((uint32_t)rw(m->mem, sp + 2) << 4) + rw(m->mem, sp);
         c->ret_sp = 0xFFFF;
         h->pw_rows = vh;
@@ -748,24 +767,27 @@ void hires_present(Hires *h, Machine *m, CPU *c) {
         const uint8_t *vram = m->mem + 0xA0000;
         if (h->ready >= 0) memcpy(h->vprev, h->fr[h->ready].vmask, sizeof h->vprev);
         else memset(h->vprev, 0, sizeof h->vprev);
-        for (int i = 0; i < 320 * p->vh; i++) {
-            p->vmask[i] = vram[i] == p->buf[i];
-            if (!p->vmask[i]) h->nonview[i] = 1;
-        }
+        for (int r = 0; r < p->vh; r++)
+            for (int x = 0; x < p->vw; x++) {
+                int i = r * p->vw + x;
+                p->vmask[i] = vram[(r + p->sy) * 320 + x + p->sx] == p->buf[i];
+                if (!p->vmask[i]) h->nonview[i] = 1;
+            }
         if (dbg_on()) {
             int a1 = 0, a2 = 0, a3 = 0;
             const uint8_t *cur = m->mem + ((uint32_t)seg << 4);
-            for (int i = 0; i < 320 * p->vh; i++) { a1 += p->vmask[i]; a2 += vram[i] == cur[i]; a3 += p->buf[i] == cur[i]; }
+            for (int i = 0; i < p->vw * p->vh; i++) { int j = (i / p->vw + p->sy) * 320 + i % p->vw + p->sx; a1 += p->vmask[i]; a2 += vram[j] == cur[i]; a3 += p->buf[i] == cur[i]; }
             fprintf(stderr, "[hires] present %04X: screen=pending %d screen=new %d pending=new %d\n", seg, a1, a2, a3);
         }
         h->ready = h->pend;
         h->pend = -1;
     }
-    /* only the full-width view (the forward view from the cockpit); the
-     * side and rear views use a narrower buffer placed elsewhere on screen */
+    /* every view; the rear, up and shoulder views are narrower and placed
+     * elsewhere on the screen */
     if (dbg_on()) fprintf(stderr, "[hires] present %04X ni=%d vw=%d vh=%d t=%.0f\n", seg, f->ni, vw, vh, m->time_us / 1000);
-    if (h->found > 0 && f->ni > 0 && vw == 320 && vh > 8 && vh <= VIEW_MAX && ((uint32_t)seg << 4) + 320u * vh < 0xA0000) {
-        memcpy(f->buf, m->mem + ((uint32_t)seg << 4), 320u * vh);
+    if (h->found > 0 && f->ni > 0 && vok && f->vw == vw && ((uint32_t)seg << 4) + (uint32_t)vw * vh < 0xA0000) {
+        memcpy(f->buf, m->mem + ((uint32_t)seg << 4), (size_t)vw * vh);
+        f->sx = sx; f->sy = sy;
         /* no record of the renderer's pixels: allow the ground everywhere */
         f->gok = f->gseg == seg;
         if (!f->gok) memset(f->gmask, 1, sizeof f->gmask);
@@ -778,6 +800,7 @@ void hires_present(Hires *h, Machine *m, CPU *c) {
     }
     f = &h->fr[h->cur];
     f->ne = f->nv = f->ni = 0;
+    f->vw = 0;
     f->gseg = 0;
     memset(f->lmask, 0, sizeof f->lmask);
     h->pass_start = 0;
@@ -793,7 +816,8 @@ void hires_present_done(Hires *h, Machine *m, CPU *c) {
     if (!h->pw_rows || c->wt_map != h->pwmap) return;
     c->wt_len = 0;
     int n = 0;
-    for (int i = 0; i < 320 * h->pw_rows; i++) if (h->pwmap[i]) { h->vacc[i] = 1; n++; }
+    for (int i = 0; i < 320 * h->pw_rows; i++)
+        if (h->pwmap[i] && i % 320 < h->vacc_vw) { h->vacc[(i / 320) * h->vacc_vw + i % 320] = 1; n++; }
     if (dbg_on()) fprintf(stderr, "[hires] present wrote %d pixels\n", n);
     h->pw_rows = 0;
 }
@@ -803,9 +827,9 @@ void hires_debug(Hires *h, Machine *m, FILE *out) {
     if (h->ready >= 0) {
         const HFrame *f = &h->fr[h->ready];
         int same = 0;
-        for (int i = 0; i < 320 * f->vh; i++) same += m->mem[0xA0000 + i] == f->buf[i];
-        fprintf(out, " vh=%d bot=%.1f edges=%d items=%d age=%.0fms same=%.0f%%", f->vh, f->bot, f->ne, f->ni,
-                (m->time_us - f->time_us) / 1000, f->vh ? 100.0 * same / (320 * f->vh) : 0);
+        for (int i = 0; i < f->vw * f->vh; i++) same += m->mem[0xA0000 + (i / f->vw + f->sy) * 320 + i % f->vw + f->sx] == f->buf[i];
+        fprintf(out, " vw=%d vh=%d at %d,%d bot=%.1f edges=%d items=%d age=%.0fms same=%.0f%%", f->vw, f->vh, f->sx, f->sy, f->bot, f->ne, f->ni,
+                (m->time_us - f->time_us) / 1000, f->vh && f->vw ? 100.0 * same / (f->vw * f->vh) : 0);
     }
     uint32_t ds = (uint32_t)h->ds << 4;
     if (h->ds) fprintf(out, " [2591]=%d [2593]=%d [2583]=%d [2587]=%d [2595]=%d", (int16_t)rw(m->mem, ds + 0x2591), (int16_t)rw(m->mem, ds + 0x2593),
@@ -939,7 +963,7 @@ typedef struct { Hires *h; uint8_t kind, col; } MarkCtx;
 static void span_mark(const Target *t, int row, int x0, int x1, void *ctx) {
     const MarkCtx *p = ctx;
     (void)t;
-    for (int x = x0; x < x1; x++) { p->h->kind1[row * 320 + x] = p->kind; p->h->base1[row * 320 + x] = p->col; }
+    for (int x = x0; x < x1; x++) { p->h->kind1[row * t->w + x] = p->kind; p->h->base1[row * t->w + x] = p->col; }
 }
 
 typedef struct { uint16_t *buf; uint8_t col; } SFillCtx;
@@ -1084,7 +1108,7 @@ static void draw_ground(Hires *h, const HFrame *f, const HItem *it, const Target
             uint16_t c = h->sbuf[(size_t)rs * sw + iu];
             if (!c) continue;
             uint8_t col = (uint8_t)(c - 1);
-            int gi = (r / s) * 320 + x / s;
+            int gi = (r / s) * (t->w / s) + x / s;
             if (t->bgk && t->bgk[gi] == BG_HORIZON) { if (map_v(t->gm, X, R) >= t->vh) continue; }
             else if (t->gmask && !t->gmask[gi]) continue;
             if (mark) { h->kind1[gi] = 1; h->base1[gi] = col; }
@@ -1259,15 +1283,18 @@ int hires_compose(Hires *h, Machine *m, int n, uint32_t *out) {
     if (m->vmode != 0x13 || m->planar) return dbg_why("mode", m->vmode, m->planar);
     const HFrame *f = &h->fr[h->ready];
     if (m->time_us - f->time_us > 500000.0) return dbg_why("age", m->time_us - f->time_us, 0);
-    const int vh = f->vh, W = 320;
+    const int vh = f->vh, W = f->vw, sx = f->sx, sy = f->sy;
+    if (W < 16 || W > 320) return dbg_why("width", W, 0);
     const uint8_t *src = f->buf, *vram = m->mem + 0xA0000;
+#define SCR(i) (((i) / W + sy) * 320 + (i) % W + sx)
 
     /* the 3D view must take a fair part of the screen, and the screen must
      * still show this frame or the one being copied (not the map or a menu) */
-    const uint8_t *nxt = h->pend >= 0 ? h->fr[h->pend].buf : src;
+    const HFrame *pf = h->pend >= 0 ? &h->fr[h->pend] : NULL;
+    const uint8_t *nxt = pf && pf->vw == W && pf->vh == vh && pf->sx == sx && pf->sy == sy ? pf->buf : src;
     int same = 0, live = 0;
     for (int i = 0; i < W * vh; i++)
-        if (f->vmask[i]) { same++; live += vram[i] == src[i] || vram[i] == nxt[i]; }
+        if (f->vmask[i]) { same++; live += vram[SCR(i)] == src[i] || vram[SCR(i)] == nxt[i]; }
     if (same < W * vh / 4) return dbg_why("same", same, W * vh);
     if (live < same / 2) return dbg_why("live", live, same);
     if (dbg_on()) fprintf(stderr, "[hires] ok serial %llu same %d\n", (unsigned long long)f->serial, same);
@@ -1654,18 +1681,20 @@ screen:;
      * where it has gone again the redrawn view shows. */
     const uint32_t *pal = m->palette_rgba;
     uint8_t mask = m->dac_mask;
-    for (int y = 0; y < 200; y++) {
-        for (int x = 0; x < W; x++) {
-            uint8_t v = vram[y * W + x];
-            uint32_t *o = out + (size_t)y * n * HW + (size_t)x * n;
-            int i3 = y * W + x;
+    const size_t OW = (size_t)320 * n;
+    for (int Y = 0; Y < 200; Y++) {
+        for (int X = 0; X < 320; X++) {
+            uint8_t v = vram[Y * 320 + X];
+            uint32_t *o = out + (size_t)Y * n * OW + (size_t)X * n;
+            int y = Y - sy, x = X - sx, inside = y >= 0 && y < vh && x >= 0 && x < W;
+            int i3 = inside ? y * W + x : 0;
             /* part of the 3D view: written by the game's present routine at
              * some time, or never seen different from the 3D frame */
-            int view = h->vacc[i3] || (!h->nonview[i3] && f->vmask[i3]);
-            if (y < vh && view && (v == src[i3] || v == nxt[i3])) {
+            int view = inside && (h->vacc[i3] || (!h->nonview[i3] && f->vmask[i3]));
+            if (view && (v == src[i3] || v == nxt[i3])) {
                 for (int yy = 0; yy < n; yy++) {
                     const uint8_t *hi = h->hidx + (size_t)(y * n + yy) * HW + x * n;
-                    uint32_t *oo = o + (size_t)yy * HW;
+                    uint32_t *oo = o + (size_t)yy * OW;
                     for (int xx = 0; xx < n; xx++) oo[xx] = pal[hi[xx] & mask];
                     if (m->hires_sources) {
                         /* source view: half the picture, half the colour of the source */
@@ -1681,11 +1710,12 @@ screen:;
             } else {
                 uint32_t c = pal[v & mask];
                 for (int yy = 0; yy < n; yy++) {
-                    uint32_t *oo = o + (size_t)yy * HW;
+                    uint32_t *oo = o + (size_t)yy * OW;
                     for (int xx = 0; xx < n; xx++) oo[xx] = c;
                 }
             }
         }
     }
+#undef SCR
     return 1;
 }
